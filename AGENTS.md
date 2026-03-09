@@ -81,7 +81,7 @@ When debugging this error, systematic testing is required to identify the actual
 
 **Kiro Gateway** is a Python FastAPI proxy server that provides OpenAI-compatible and Anthropic-compatible APIs for Kiro (Amazon Q Developer / AWS CodeWhisperer). It translates requests between different API formats and handles authentication, streaming, model resolution, and error handling.
 
-- **Language**: Python 3.10+
+- **Language**: Python 3.14+
 - **Framework**: FastAPI with uvicorn
 - **License**: AGPL-3.0
 - **Main Entry Point**: `main.py`

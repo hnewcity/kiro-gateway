@@ -9,7 +9,7 @@
 Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Apoya_el_Desarrollo-ff69b4)](#-apoya-el-proyecto)
 
@@ -71,7 +71,7 @@ Hecho con ❤️ por [@Jwadow](https://github.com/jwadow)
 
 ### Prerrequisitos
 
-- Python 3.10+
+- Python 3.14+
 - Uno de los siguientes:
   - [Kiro IDE](https://kiro.dev/) con cuenta iniciada, O
   - [Kiro CLI](https://kiro.dev/cli/) con AWS SSO (AWS IAM Identity Center, OIDC) - Builder ID gratuito o cuenta empresarial

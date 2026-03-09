@@ -9,7 +9,7 @@
 Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-Dukung_Pengembangan-ff69b4)](#-dukung-proyek)
 
@@ -71,7 +71,7 @@ Dibuat dengan ❤️ oleh [@Jwadow](https://github.com/jwadow)
 
 ### Prasyarat
 
-- Python 3.10+
+- Python 3.14+
 - Salah satu dari berikut:
   - [Kiro IDE](https://kiro.dev/) dengan akun yang sudah login, ATAU
   - [Kiro CLI](https://kiro.dev/cli/) dengan AWS SSO (AWS IAM Identity Center, OIDC) - Builder ID gratis atau akun perusahaan

@@ -9,7 +9,7 @@
 由 [@Jwadow](https://github.com/jwadow) 用 ❤️ 制作
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-支持开发-ff69b4)](#-支持项目)
 
@@ -71,7 +71,7 @@
 
 ### 前置要求
 
-- Python 3.10+
+- Python 3.14+
 - 以下之一：
   - 已登录账户的 [Kiro IDE](https://kiro.dev/)，或
   - 带有 AWS SSO (AWS IAM Identity Center, OIDC) 的 [Kiro CLI](https://kiro.dev/cli/) - 免费 Builder ID 或企业账户

@@ -9,7 +9,7 @@
 [@Jwadow](https://github.com/jwadow)가 ❤️를 담아 제작
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 [![Sponsor](https://img.shields.io/badge/💖_Sponsor-개발_지원-ff69b4)](#-프로젝트-후원)
 
@@ -71,7 +71,7 @@
 
 ### 사전 요구 사항
 
-- Python 3.10+
+- Python 3.14+
 - 다음 중 하나:
   - 로그인된 계정이 있는 [Kiro IDE](https://kiro.dev/), 또는
   - AWS SSO (AWS IAM Identity Center, OIDC)가 있는 [Kiro CLI](https://kiro.dev/cli/) - 무료 Builder ID 또는 기업 계정
