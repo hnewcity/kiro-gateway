@@ -9,9 +9,6 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Create non-root user for security
-RUN groupadd -r kiro && useradd -r -g kiro kiro
-
 # Set working directory
 WORKDIR /app
 
@@ -20,13 +17,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY --chown=kiro:kiro . .
+COPY . .
 
-# Create directory for debug logs with proper permissions
-RUN mkdir -p debug_logs && chown -R kiro:kiro debug_logs
-
-# Switch to non-root user
-USER kiro
+# Create directory for debug logs
+RUN mkdir -p debug_logs
 
 # Expose port
 EXPOSE 8000
