@@ -49,7 +49,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
+from kiro.utils import generate_conversation_id, get_kiro_headers
 
 # Import debug_logger
 try:
@@ -148,6 +148,39 @@ async def get_models(request: Request):
     ]
     
     return ModelList(data=openai_models)
+
+
+@router.get("/v1/usage", dependencies=[Depends(verify_api_key)])
+async def get_usage(request: Request):
+    """
+    Query Kiro credit usage via GetUsageLimits API.
+
+    Returns subscription info, credit usage breakdown, overage config,
+    and reset date — the same data shown by kiro-cli's /usage command.
+    """
+    logger.info("Request to /v1/usage")
+
+    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    shared_client = request.app.state.http_client
+
+    token = await auth_manager.get_access_token()
+    headers = get_kiro_headers(auth_manager, token)
+    headers["x-amz-target"] = "com.amazon.aws.codewhisperer.runtime.AmazonCodeWhispererService.GetUsageLimits"
+    headers["Content-Type"] = "application/x-amz-json-1.0"
+
+    url = auth_manager.api_host
+    body = {"origin": "AI_EDITOR"}
+
+    try:
+        response = await shared_client.post(url, json=body, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return JSONResponse(content=response.json())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching usage: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Failed to fetch usage: {str(e)}")
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
