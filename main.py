@@ -731,14 +731,14 @@ def print_startup_banner(host: str, port: int) -> None:
 if __name__ == "__main__":
     import uvicorn
     
+    # Parse CLI arguments first (handles --version, --help without requiring config)
+    args = parse_cli_args()
+    
     # Run configuration validation before starting server
     validate_configuration()
     
     # Warn about suboptimal timeout configuration
     _warn_timeout_configuration()
-    
-    # Parse CLI arguments
-    args = parse_cli_args()
     
     # Resolve final configuration with priority hierarchy
     final_host, final_port = resolve_server_config(args)
