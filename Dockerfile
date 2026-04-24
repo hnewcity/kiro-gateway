@@ -12,8 +12,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Create non-root user for security
 RUN groupadd -r kiro && useradd -r -g kiro kiro
 
-# Set working directory
+# Set working directory and give ownership to kiro user
 WORKDIR /app
+RUN chown kiro:kiro /app
 
 # Install dependencies first (better layer caching)
 COPY requirements.txt .

@@ -408,14 +408,11 @@ async def lifespan(app: FastAPI):
                         "refresh_token": REFRESH_TOKEN
                     }
                     _add_env_overrides(entry)
-                    credentials.append(entry)
-                
-                # Save credentials.json
-                # Remove file first if exists (handles read-only files from Docker cache)
-                if creds_path.exists():
-                    creds_path.unlink()
-                with open(creds_path, 'w', encoding='utf-8') as f:
-                    json.dump(credentials, f, indent=2, ensure_ascii=False)
+                credentials.append(entry)
+            
+            # Save credentials.json
+            with open(creds_path, 'w', encoding='utf-8') as f:
+                json.dump(credentials, f, indent=2, ensure_ascii=False)
                 
                 logger.info("Created credentials.json from .env (one-time migration)")
     else:
@@ -448,9 +445,6 @@ async def lifespan(app: FastAPI):
                 credentials.append(entry)
             
             # Save credentials.json (overwrite if exists)
-            # Remove file first if exists (handles read-only files from Docker cache)
-            if creds_path.exists():
-                creds_path.unlink()
             with open(creds_path, 'w', encoding='utf-8') as f:
                 json.dump(credentials, f, indent=2, ensure_ascii=False)
             
