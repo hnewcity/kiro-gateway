@@ -125,6 +125,7 @@ class KiroAuthManager:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
+        api_region: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -138,6 +139,8 @@ class KiroAuthManager:
             client_secret: OAuth client secret (for AWS SSO OIDC, optional)
             sqlite_db: Path to kiro-cli SQLite database (optional)
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
+            api_region: Q API region override (optional, per-account)
+                       If not specified, uses auto-detection or falls back to region
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
@@ -183,14 +186,19 @@ class KiroAuthManager:
         self._detect_auth_type()
         
         # Determine final API region with priority hierarchy:
-        # 1. KIRO_API_REGION env var (explicit override) - highest priority
-        # 2. Auto-detected from credentials (SQLite ARN or JSON region)
-        # 3. SSO region (fallback)
-        # 4. Default region parameter (us-east-1)
+        # 1. Explicit api_region parameter (per-account) - HIGHEST
+        # 2. KIRO_API_REGION env var (global override)
+        # 3. Auto-detected from credentials (SQLite ARN or JSON region)
+        # 4. SSO region (fallback)
+        # 5. Default region parameter (us-east-1)
         api_region_override = os.getenv("KIRO_API_REGION")
         
-        if api_region_override:
-            # Explicit override from environment variable
+        if api_region:
+            # Explicit per-account override
+            final_api_region = api_region
+            logger.info(f"API region: {final_api_region} (from account config)")
+        elif api_region_override:
+            # Global env var override
             final_api_region = api_region_override
             logger.info(f"API region: {final_api_region} (from KIRO_API_REGION env var)")
         elif self._detected_api_region:

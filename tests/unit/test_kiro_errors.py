@@ -487,8 +487,8 @@ class TestEnhanceImproperlyFormedRequest:
         }
         error_info = enhance_kiro_error(error_json)
 
-        assert "payload size exceeded" in error_info.user_message
-        assert "/compact" in error_info.user_message
+        assert "problem persists" in error_info.user_message
+        assert "jwadow/kiro-gateway" in error_info.user_message
         assert error_info.original_message == "Improperly formed request."
 
     def test_enhance_improperly_formed_request_unknown_reason(self):
@@ -496,7 +496,7 @@ class TestEnhanceImproperlyFormedRequest:
         error_json = {"message": "Improperly formed request."}
         error_info = enhance_kiro_error(error_json)
 
-        assert "payload size exceeded" in error_info.user_message
+        assert "problem persists" in error_info.user_message
 
     def test_improperly_formed_with_real_reason_not_enhanced(self):
         """If reason is a real code, don't apply the size-limit enhancement."""
