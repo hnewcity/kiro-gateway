@@ -129,7 +129,8 @@ async def get_usage(request: Request):
     """
     logger.info("Request to /v1/usage")
 
-    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    account = request.app.state.account_manager.get_first_account()
+    auth_manager: KiroAuthManager = account.auth_manager
     shared_client = request.app.state.http_client
 
     token = await auth_manager.get_access_token()
