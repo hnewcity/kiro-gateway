@@ -2148,6 +2148,41 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print(f"✅ Token count: {data['input_tokens']} tokens")
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_uses_public_usage_estimation_policy(self):
+        """
+        What it does: Verifies count_tokens uses the same public estimation policy as /v1/messages.
+        Purpose: Prevent reintroducing the extra Claude correction multiplier for this endpoint.
+        """
+        print("Setup: Mocking request token estimator...")
+        from kiro.models_anthropic import AnthropicCountTokensRequest
+        from kiro.routes_anthropic import count_tokens_endpoint
+
+        request_data = AnthropicCountTokensRequest(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "Hello"}],
+            system="You are concise.",
+        )
+
+        with patch("kiro.routes_anthropic.estimate_request_tokens", return_value={"total_tokens": 17}) as mock_estimate:
+            print("Action: Calling count_tokens endpoint handler...")
+            response = await count_tokens_endpoint(request=None, request_data=request_data)
+
+        print(f"Status: {response.status_code}")
+        print(f"Response body: {response.body}")
+
+        assert response.status_code == 200
+        data = json.loads(response.body)
+        assert data["input_tokens"] == 17
+        mock_estimate.assert_called_once_with(
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=None,
+            system_prompt="You are concise.",
+            apply_claude_correction=False,
+        )
+
+        print("✅ Count tokens endpoint uses public usage estimation policy")
     
     def test_count_tokens_with_tools(self, test_client, valid_proxy_api_key):
         """

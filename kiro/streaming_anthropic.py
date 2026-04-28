@@ -44,7 +44,6 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     FirstTokenTimeoutError,
     KiroEvent,
-    calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
@@ -624,15 +623,14 @@ async def stream_kiro_to_anthropic(
         # Calculate output tokens
         output_tokens = count_tokens(full_content + full_thinking_content)
         
-        # Calculate total tokens from context usage if available
+        # Keep client-visible usage based on request estimation.
+        # Kiro context usage is a coarse percentage of the context window and
+        # can greatly overstate small requests when converted back to tokens.
         if context_usage_percentage is not None:
-            prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
-                context_usage_percentage, output_tokens, model_cache, model
+            logger.debug(
+                f"Kiro context usage available but not used for public Anthropic input_tokens: "
+                f"context_usage={context_usage_percentage}, estimated_input_tokens={input_tokens}"
             )
-            # Don't override fallback when context_usage=0% (returns source="unknown")
-            # Only override local estimate when upstream context usage is available
-            if prompt_source != "unknown":
-                input_tokens = prompt_tokens
         
         # Determine stop reason (truncation has highest priority)
         if content_was_truncated:
@@ -806,14 +804,14 @@ async def collect_anthropic_response(
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)
     
-    # Calculate from context usage if available
+    # Keep client-visible usage based on request estimation.
+    # Kiro context usage is a coarse percentage of the context window and
+    # can greatly overstate small requests when converted back to tokens.
     if result.context_usage_percentage is not None:
-        prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
-            result.context_usage_percentage, output_tokens, model_cache, model
+        logger.debug(
+            f"Kiro context usage available but not used for public Anthropic input_tokens: "
+            f"context_usage={result.context_usage_percentage}, estimated_input_tokens={input_tokens}"
         )
-        # Don't override fallback when context_usage=0% (returns source="unknown")
-        if prompt_source != "unknown":
-            input_tokens = prompt_tokens
     
     # Detect content truncation (missing completion signals)
     stream_completed_normally = result.context_usage_percentage is not None

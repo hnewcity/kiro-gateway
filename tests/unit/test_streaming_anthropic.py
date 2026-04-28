@@ -1053,10 +1053,10 @@ class TestStreamingAnthropicContextUsage:
     """Tests for context usage calculation in Anthropic streaming."""
     
     @pytest.mark.asyncio
-    async def test_calculates_tokens_from_context_usage(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_context_usage_does_not_override_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Calculates tokens from context usage percentage.
-        Goal: Verify token calculation.
+        What it does: Keeps request estimate when context usage percentage is available.
+        Goal: Avoid exposing coarse Kiro context percentage as exact input tokens.
         """
         print("Setup: Mock stream with context usage...")
         
@@ -1069,10 +1069,12 @@ class TestStreamingAnthropicContextUsage:
         
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                async for event in stream_kiro_to_anthropic(
-                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-                ):
-                    events.append(event)
+                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 42}):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                        request_messages=[{"role": "user", "content": "Hi"}]
+                    ):
+                        events.append(event)
         
         print(f"Received {len(events)} events")
         
@@ -1080,7 +1082,9 @@ class TestStreamingAnthropicContextUsage:
         message_delta_events = [e for e in events if "message_delta" in e]
         assert len(message_delta_events) >= 1
         assert "output_tokens" in message_delta_events[0]
-        print("✓ Tokens calculated from context usage")
+        message_start_event = next(e for e in events if "event: message_start" in e)
+        assert '"input_tokens": 42' in message_start_event
+        print("✓ Context usage did not override request estimate")
     
     @pytest.mark.asyncio
     async def test_uses_request_messages_for_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
