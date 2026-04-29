@@ -253,6 +253,7 @@ async def messages(
     # ==============================================================================
     
     # Auto-inject web_search tool if enabled (Path B - MCP emulation)
+    web_search_auto_injected = False
     if WEB_SEARCH_ENABLED:
         if request_data.tools is None:
             request_data.tools = []
@@ -277,6 +278,7 @@ async def messages(
                 }
             )
             request_data.tools.append(web_search_tool)
+            web_search_auto_injected = True
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
     
     # ==============================================================================
@@ -419,7 +421,11 @@ async def messages(
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-            tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+            public_tools = [
+                tool for tool in (request_data.tools or [])
+                if not (web_search_auto_injected and getattr(tool, "name", "") == "web_search")
+            ]
+            tools_for_tokenizer = [tool.model_dump() for tool in public_tools] if public_tools else None
             if isinstance(request_data.system, list):
                 system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
             else:
@@ -735,7 +741,11 @@ async def messages(
     # Prepare data for token counting
     # Convert Pydantic models to dicts for tokenizer
     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+    public_tools = [
+        tool for tool in (request_data.tools or [])
+        if not (web_search_auto_injected and getattr(tool, "name", "") == "web_search")
+    ]
+    tools_for_tokenizer = [tool.model_dump() for tool in public_tools] if public_tools else None
     # Serialize system prompt (may be a list of Pydantic objects)
     if isinstance(request_data.system, list):
         system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
@@ -952,7 +962,8 @@ async def count_tokens_endpoint(
         messages=messages_for_tokenizer,
         tools=tools_for_tokenizer,
         system_prompt=system_for_tokenizer,
-        apply_claude_correction=False
+        apply_claude_correction=False,
+        include_tool_schemas=False
     )
     
     input_tokens = request_token_stats["total_tokens"]

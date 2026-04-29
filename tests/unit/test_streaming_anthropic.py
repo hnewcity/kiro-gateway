@@ -1118,7 +1118,8 @@ class TestStreamingAnthropicContextUsage:
                         messages=request_messages,
                         tools=None,
                         system_prompt=None,
-                        apply_claude_correction=False
+                        apply_claude_correction=False,
+                        include_tool_schemas=False
                     )
         
         print("✓ Request messages used for input token count")
@@ -1155,7 +1156,8 @@ class TestStreamingAnthropicContextUsage:
                         messages=request_messages,
                         tools=request_tools,
                         system_prompt=request_system,
-                        apply_claude_correction=False
+                        apply_claude_correction=False,
+                        include_tool_schemas=False
                     )
         print("✓ Request tools and system included in token count")
 

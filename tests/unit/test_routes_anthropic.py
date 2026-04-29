@@ -2180,6 +2180,7 @@ class TestCountTokensEndpoint:
             tools=None,
             system_prompt="You are concise.",
             apply_claude_correction=False,
+            include_tool_schemas=False,
         )
 
         print("✅ Count tokens endpoint uses public usage estimation policy")

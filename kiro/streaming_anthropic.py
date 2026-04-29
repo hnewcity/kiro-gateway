@@ -177,7 +177,8 @@ async def stream_kiro_to_anthropic(
             messages=request_messages or [],
             tools=request_tools,
             system_prompt=request_system,
-            apply_claude_correction=False
+            apply_claude_correction=False,
+            include_tool_schemas=False
         )
         input_tokens = request_token_stats["total_tokens"]
     
@@ -751,7 +752,8 @@ async def collect_anthropic_response(
             messages=request_messages or [],
             tools=request_tools,
             system_prompt=request_system,
-            apply_claude_correction=False
+            apply_claude_correction=False,
+            include_tool_schemas=False
         )
         input_tokens = request_token_stats["total_tokens"]
     

@@ -210,13 +210,19 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
     return total_tokens
 
 
-def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_correction: bool = True) -> int:
+def count_tools_tokens(
+    tools: Optional[List[Dict[str, Any]]],
+    apply_claude_correction: bool = True,
+    include_schema: bool = True
+) -> int:
     """
     Counts tokens in tool definitions.
     
     Args:
         tools: List of tools in OpenAI format
         apply_claude_correction: Apply correction coefficient for Claude
+        include_schema: Include full JSON schema tokens. Disable for public
+            usage estimates where large tool schemas create noisy token reports.
     
     Returns:
         Approximate number of tokens (with Claude correction)
@@ -239,13 +245,14 @@ def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_corre
         total_tokens += count_tokens(tool_payload.get("name", ""), apply_claude_correction=False)
         total_tokens += count_tokens(tool_payload.get("description", ""), apply_claude_correction=False)
 
-        # JSON schema（Anthropic: input_schema, OpenAI: parameters）
-        params = tool_payload.get("input_schema")
-        if params is None:
-            params = tool_payload.get("parameters")
-        if params is not None:
-            params_str = json.dumps(params, ensure_ascii=False)
-            total_tokens += count_tokens(params_str, apply_claude_correction=False)
+        if include_schema:
+            # JSON schema（Anthropic: input_schema, OpenAI: parameters）
+            params = tool_payload.get("input_schema")
+            if params is None:
+                params = tool_payload.get("parameters")
+            if params is not None:
+                params_str = json.dumps(params, ensure_ascii=False)
+                total_tokens += count_tokens(params_str, apply_claude_correction=False)
     
     # Apply correction to total count
     if apply_claude_correction:
@@ -297,7 +304,8 @@ def estimate_request_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
     system_prompt: Optional[Any] = None,
-    apply_claude_correction: bool = True
+    apply_claude_correction: bool = True,
+    include_tool_schemas: bool = True
 ) -> Dict[str, int]:
     """
     Estimates total number of tokens in request.
@@ -307,6 +315,8 @@ def estimate_request_tokens(
         tools: List of tools (optional)
         system_prompt: System prompt (optional, string or Anthropic content blocks)
         apply_claude_correction: Apply correction coefficient for Claude
+        include_tool_schemas: Include full tool JSON schemas. Set to False for
+            client-visible usage estimates that should avoid schema noise.
     
     Returns:
         Dictionary with token breakdown:
@@ -316,7 +326,11 @@ def estimate_request_tokens(
         - total_tokens: total count
     """
     messages_tokens = count_message_tokens(messages, apply_claude_correction=apply_claude_correction)
-    tools_tokens = count_tools_tokens(tools, apply_claude_correction=apply_claude_correction)
+    tools_tokens = count_tools_tokens(
+        tools,
+        apply_claude_correction=apply_claude_correction,
+        include_schema=include_tool_schemas
+    )
     system_tokens = count_system_tokens(system_prompt, apply_claude_correction=apply_claude_correction)
     
     return {

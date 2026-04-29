@@ -517,6 +517,38 @@ class TestCountToolsTokens:
         print(f"Result: {result}")
         
         assert result > 0, "Complex tool should have tokens"
+
+    def test_can_exclude_schema_for_public_usage_estimate(self):
+        """
+        What it does: Checks lightweight tool counting without full JSON schemas.
+        Purpose: Keep public usage estimates from being dominated by large tool schemas.
+        """
+        print("Test: Excluding tool schema...")
+        tools = [
+            {
+                "name": "complex_function",
+                "description": "A function with complex parameters",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        f"field_{index}": {
+                            "type": "string",
+                            "description": "Long schema field description for public usage estimate tests."
+                        }
+                        for index in range(20)
+                    }
+                }
+            }
+        ]
+
+        full_count = count_tools_tokens(tools, apply_claude_correction=False, include_schema=True)
+        public_count = count_tools_tokens(tools, apply_claude_correction=False, include_schema=False)
+
+        print(f"Full count: {full_count}")
+        print(f"Public count: {public_count}")
+
+        assert public_count > 0
+        assert full_count > public_count
     
     def test_tool_without_parameters(self):
         """
