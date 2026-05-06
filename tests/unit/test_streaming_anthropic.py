@@ -683,7 +683,7 @@ class TestCollectAnthropicResponse:
         print("Action: Collecting Anthropic response...")
         
         with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
-            with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 10}):
+            with patch('kiro.streaming_anthropic.count_message_tokens', return_value=10):
                 with patch('kiro.streaming_anthropic.count_tokens', return_value=5):
                     result = await collect_anthropic_response(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
@@ -1051,41 +1051,37 @@ class TestStreamingAnthropicThinkingContent:
 
 class TestStreamingAnthropicContextUsage:
     """Tests for context usage calculation in Anthropic streaming."""
-    
+
     @pytest.mark.asyncio
-    async def test_context_usage_does_not_override_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_calculates_tokens_from_context_usage(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Keeps request estimate when context usage percentage is available.
-        Goal: Avoid exposing coarse Kiro context percentage as exact input tokens.
+        What it does: Calculates tokens from context usage percentage.
+        Goal: Verify token calculation.
         """
         print("Setup: Mock stream with context usage...")
-        
+
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(type="content", content="Hello")
             yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
-        
+
         print("Action: Streaming to Anthropic format...")
         events = []
-        
+
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 42}):
-                    async for event in stream_kiro_to_anthropic(
-                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
-                        request_messages=[{"role": "user", "content": "Hi"}]
-                    ):
-                        events.append(event)
-        
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
         print(f"Received {len(events)} events")
-        
+
         # message_delta should have usage with output_tokens
         message_delta_events = [e for e in events if "message_delta" in e]
         assert len(message_delta_events) >= 1
         assert "output_tokens" in message_delta_events[0]
-        message_start_event = next(e for e in events if "event: message_start" in e)
-        assert '"input_tokens": 42' in message_start_event
-        print("✓ Context usage did not override request estimate")
-    
+        print("✓ Tokens calculated from context usage")
+
     @pytest.mark.asyncio
     async def test_uses_request_messages_for_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
         """
@@ -1093,96 +1089,30 @@ class TestStreamingAnthropicContextUsage:
         Goal: Verify input tokens are counted from request.
         """
         print("Setup: Mock stream...")
-        
+
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(type="content", content="Hello")
-        
+
         request_messages = [
             {"role": "user", "content": "Hi there!"}
         ]
-        
+
         print("Action: Streaming to Anthropic format with request messages...")
         events = []
-        
+
         with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
             with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 10}) as mock_estimate:
+                with patch('kiro.streaming_anthropic.count_message_tokens', return_value=10) as mock_count:
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
                         request_messages=request_messages
                     ):
                         events.append(event)
-                    
-                    # Verify estimate_request_tokens was called
-                    mock_estimate.assert_called_once_with(
-                        messages=request_messages,
-                        tools=None,
-                        system_prompt=None,
-                        apply_claude_correction=False,
-                        include_tool_schemas=False
-                    )
-        
+
+                    # Verify count_message_tokens was called
+                    mock_count.assert_called_once_with(request_messages, apply_claude_correction=False)
+
         print("✓ Request messages used for input token count")
-
-    @pytest.mark.asyncio
-    async def test_uses_tools_and_system_for_input_tokens(self, mock_response, mock_model_cache, mock_auth_manager):
-        """
-        What it does: Includes request tools and system in input token estimation.
-        Goal: Verify Anthropic fallback token counting uses full request.
-        """
-        print("Setup: Mock stream...")
-
-        async def mock_parse_kiro_stream(*args, **kwargs):
-            yield KiroEvent(type="content", content="Hello")
-
-        request_messages = [{"role": "user", "content": "Hi"}]
-        request_tools = [{"name": "get_weather", "input_schema": {"type": "object"}}]
-        request_system = [{"type": "text", "text": "你是助手"}]
-
-        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
-            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 12}) as mock_estimate:
-                    events = []
-                    async for event in stream_kiro_to_anthropic(
-                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
-                        request_messages=request_messages,
-                        request_tools=request_tools,
-                        request_system=request_system,
-                    ):
-                        events.append(event)
-
-                    assert events, "Should produce streaming events"
-                    mock_estimate.assert_called_once_with(
-                        messages=request_messages,
-                        tools=request_tools,
-                        system_prompt=request_system,
-                        apply_claude_correction=False,
-                        include_tool_schemas=False
-                    )
-        print("✓ Request tools and system included in token count")
-
-    @pytest.mark.asyncio
-    async def test_context_usage_zero_keeps_fallback_estimate(self, mock_response, mock_model_cache, mock_auth_manager):
-        """
-        What it does: Keeps fallback estimate when context usage is 0.
-        Goal: Prevent overriding with zero prompt tokens.
-        """
-        async def mock_parse_kiro_stream(*args, **kwargs):
-            yield KiroEvent(type="content", content="Hello")
-            yield KiroEvent(type="context_usage", context_usage_percentage=0.0)
-
-        events = []
-        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
-            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
-                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 99}):
-                    async for event in stream_kiro_to_anthropic(
-                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
-                        request_messages=[{"role": "user", "content": "hi"}]
-                    ):
-                        events.append(event)
-
-        message_start_event = next(e for e in events if "event: message_start" in e)
-        assert '"input_tokens": 99' in message_start_event
 
     @pytest.mark.asyncio
     async def test_non_streaming_passes_upstream_cache_usage_fields(self, mock_response, mock_model_cache, mock_auth_manager):

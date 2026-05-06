@@ -2165,7 +2165,8 @@ class TestCountTokensEndpoint:
             system="You are concise.",
         )
 
-        with patch("kiro.routes_anthropic.estimate_request_tokens", return_value={"total_tokens": 17}) as mock_estimate:
+        with patch("kiro.routes_anthropic.count_message_tokens", return_value=10) as mock_messages, \
+             patch("kiro.routes_anthropic.count_tools_tokens", return_value=0) as mock_tools:
             print("Action: Calling count_tokens endpoint handler...")
             response = await count_tokens_endpoint(request=None, request_data=request_data)
 
@@ -2174,14 +2175,12 @@ class TestCountTokensEndpoint:
 
         assert response.status_code == 200
         data = json.loads(response.body)
-        assert data["input_tokens"] == 17
-        mock_estimate.assert_called_once_with(
-            messages=[{"role": "user", "content": "Hello"}],
-            tools=None,
-            system_prompt="You are concise.",
+        assert data["input_tokens"] == 10
+        mock_messages.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}],
             apply_claude_correction=False,
-            include_tool_schemas=False,
         )
+        mock_tools.assert_called_once_with(None, apply_claude_correction=False)
 
         print("✅ Count tokens endpoint uses public usage estimation policy")
     

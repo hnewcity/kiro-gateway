@@ -44,9 +44,10 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     FirstTokenTimeoutError,
     KiroEvent,
+    calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
 )
-from kiro.tokenizer import count_tokens, estimate_request_tokens
+from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
@@ -132,16 +133,14 @@ async def stream_kiro_to_anthropic(
     auth_manager: "KiroAuthManager",
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None,
     conversation_id: Optional[str] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
-    
+
     Parses Kiro AWS SSE stream and converts events to Anthropic format.
     Supports thinking content blocks when FAKE_REASONING_HANDLING=as_reasoning_content.
-    
+
     Args:
         response: HTTP response with data stream
         model: Model name to include in response
@@ -149,13 +148,11 @@ async def stream_kiro_to_anthropic(
         auth_manager: Authentication manager
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for token counting)
-        request_tools: Original request tools (for token counting)
-        request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
-    
+
     Yields:
         Strings in Anthropic SSE format
-    
+
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
     """
@@ -164,23 +161,10 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
-    
-    # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
-    # but Kiro API provides accurate context_usage at the end of stream.
-    # This creates a fundamental limitation: we must use fallback estimation in message_start.
-    # Accuracy: ~85-90% (acceptable trade-off for maintaining streaming capability).
-    # See: https://docs.anthropic.com/en/api/messages-streaming
-    
-    # Fallback estimation must cover messages/tools/system to avoid significant undercount
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
-            messages=request_messages or [],
-            tools=request_tools,
-            system_prompt=request_system,
-            apply_claude_correction=False,
-            include_tool_schemas=False
-        )
-        input_tokens = request_token_stats["total_tokens"]
+
+    # Count input tokens from request messages
+    if request_messages:
+        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
     
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
@@ -623,15 +607,13 @@ async def stream_kiro_to_anthropic(
         
         # Calculate output tokens
         output_tokens = count_tokens(full_content + full_thinking_content)
-        
-        # Keep client-visible usage based on request estimation.
-        # Kiro context usage is a coarse percentage of the context window and
-        # can greatly overstate small requests when converted back to tokens.
+
+        # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
-            logger.debug(
-                f"Kiro context usage available but not used for public Anthropic input_tokens: "
-                f"context_usage={context_usage_percentage}, estimated_input_tokens={input_tokens}"
+            prompt_tokens, total_tokens, _, _ = calculate_tokens_from_context_usage(
+                context_usage_percentage, output_tokens, model_cache, model
             )
+            input_tokens = prompt_tokens
         
         # Determine stop reason (truncation has highest priority)
         if content_was_truncated:
@@ -722,41 +704,30 @@ async def collect_anthropic_response(
     model: str,
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
-    request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_messages: Optional[list] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
-    
+
     Used for non-streaming mode.
-    
+
     Args:
         response: HTTP response with stream
         model: Model name
         model_cache: Model cache
         auth_manager: Authentication manager
         request_messages: Original request messages (for token counting)
-        request_tools: Original request tools (for token counting)
-        request_system: Original system prompt (for token counting)
-    
+
     Returns:
         Dictionary with full response in Anthropic Messages format
     """
     message_id = generate_message_id()
-    
-    # Non-streaming uses the same full-request estimation as streaming
+
+    # Count input tokens
     input_tokens = 0
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
-            messages=request_messages or [],
-            tools=request_tools,
-            system_prompt=request_system,
-            apply_claude_correction=False,
-            include_tool_schemas=False
-        )
-        input_tokens = request_token_stats["total_tokens"]
-    
+    if request_messages:
+        input_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+
     # Collect stream result
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
@@ -805,15 +776,13 @@ async def collect_anthropic_response(
     
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)
-    
-    # Keep client-visible usage based on request estimation.
-    # Kiro context usage is a coarse percentage of the context window and
-    # can greatly overstate small requests when converted back to tokens.
+
+    # Calculate from context usage if available
     if result.context_usage_percentage is not None:
-        logger.debug(
-            f"Kiro context usage available but not used for public Anthropic input_tokens: "
-            f"context_usage={result.context_usage_percentage}, estimated_input_tokens={input_tokens}"
+        prompt_tokens, _, _, _ = calculate_tokens_from_context_usage(
+            result.context_usage_percentage, output_tokens, model_cache, model
         )
+        input_tokens = prompt_tokens
     
     # Detect content truncation (missing completion signals)
     stream_completed_normally = result.context_usage_percentage is not None
@@ -872,18 +841,17 @@ async def stream_with_first_token_retry_anthropic(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_tools: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
-    
+
     If model doesn't respond within first_token_timeout seconds,
     request is cancelled and a new one is made. Maximum max_retries attempts.
-    
+
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
-    
+
     Args:
         make_request: Function to create new HTTP request
         model: Model name
@@ -894,12 +862,11 @@ async def stream_with_first_token_retry_anthropic(
         max_retries: Maximum number of attempts
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
-        request_tools: Original request tools (for fallback token counting)
-        request_system: Original system prompt (for fallback token counting)
-    
+        request_tools: Original request tools (reserved; not used by counting now)
+
     Yields:
         Strings in Anthropic SSE format
-    
+
     Raises:
         Exception with Anthropic error format after exhausting all attempts
     """
@@ -932,8 +899,6 @@ async def stream_with_first_token_retry_anthropic(
             auth_manager,
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
-            request_tools=request_tools,
-            request_system=request_system,
         ):
             yield chunk
     

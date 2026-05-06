@@ -52,7 +52,7 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.tokenizer import estimate_request_tokens
+from kiro.tokenizer import count_message_tokens, count_tools_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -421,15 +421,6 @@ async def messages(
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-            public_tools = [
-                tool for tool in (request_data.tools or [])
-                if not (web_search_auto_injected and getattr(tool, "name", "") == "web_search")
-            ]
-            tools_for_tokenizer = [tool.model_dump() for tool in public_tools] if public_tools else None
-            if isinstance(request_data.system, list):
-                system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
-            else:
-                system_for_tokenizer = request_data.system
             
             try:
                 # Make request to Kiro API
@@ -462,8 +453,6 @@ async def messages(
                                     auth_manager=auth_manager,
                                     initial_response=response,
                                     request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer,
-                                    request_system=system_for_tokenizer,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -510,8 +499,6 @@ async def messages(
                             model_cache,
                             auth_manager,
                             request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer,
-                            request_system=system_for_tokenizer,
                         )
                         
                         await http_client.close()
@@ -741,16 +728,6 @@ async def messages(
     # Prepare data for token counting
     # Convert Pydantic models to dicts for tokenizer
     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-    public_tools = [
-        tool for tool in (request_data.tools or [])
-        if not (web_search_auto_injected and getattr(tool, "name", "") == "web_search")
-    ]
-    tools_for_tokenizer = [tool.model_dump() for tool in public_tools] if public_tools else None
-    # Serialize system prompt (may be a list of Pydantic objects)
-    if isinstance(request_data.system, list):
-        system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
-    else:
-        system_for_tokenizer = request_data.system
     
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
@@ -826,8 +803,6 @@ async def messages(
                         auth_manager=auth_manager,
                         initial_response=response,
                         request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer,
-                        request_system=system_for_tokenizer,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -875,8 +850,6 @@ async def messages(
                 model_cache,
                 auth_manager,
                 request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer,
-                request_system=system_for_tokenizer,
             )
             
             await http_client.close()
@@ -950,24 +923,13 @@ async def count_tokens_endpoint(
     # Prepare data for tokenizer (same format as streaming message_start)
     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-    
-    # Handle system prompt (can be string or list of content blocks)
-    if isinstance(request_data.system, list):
-        system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
-    else:
-        system_for_tokenizer = request_data.system
-    
-    # Use the SAME estimation logic as Anthropic streaming message_start
-    request_token_stats = estimate_request_tokens(
-        messages=messages_for_tokenizer,
-        tools=tools_for_tokenizer,
-        system_prompt=system_for_tokenizer,
-        apply_claude_correction=False,
-        include_tool_schemas=False
-    )
-    
-    input_tokens = request_token_stats["total_tokens"]
-    
+
+    # Use the SAME counting logic as Anthropic streaming message_start:
+    # messages only, no Claude correction. Tools are counted separately
+    # without their JSON schema to avoid noisy estimates for public usage.
+    input_tokens = count_message_tokens(messages_for_tokenizer, apply_claude_correction=False)
+    input_tokens += count_tools_tokens(tools_for_tokenizer, apply_claude_correction=False)
+
     logger.info(f"Token count estimate: {input_tokens} tokens")
-    
+
     return JSONResponse(content={"input_tokens": input_tokens})
