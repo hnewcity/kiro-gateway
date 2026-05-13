@@ -242,6 +242,37 @@ class TestConvertOpenAIMessagesToUnified:
         
         print(f"Comparing image data: Expected {test_image_base64[:20]}..., Got {image.get('data', '')[:20]}...")
         assert image["data"] == test_image_base64
+
+    def test_extracts_text_document_from_user_message(self):
+        """
+        What it does: Verifies text file content blocks are converted into message text.
+        Purpose: Ensure document blocks are not silently dropped.
+        """
+        print("Setup: User message with text file content block...")
+        messages = [
+            ChatMessage(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Read this file:"},
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "note.txt",
+                            "file_data": "data:text/plain;base64,SGVsbG8gZnJvbSBmaWxl"
+                        }
+                    }
+                ]
+            )
+        ]
+
+        print("Action: Converting messages...")
+        system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        print(f"Unified content: {unified[0].content}")
+        assert len(unified) == 1
+        assert "Read this file:" in unified[0].content
+        assert "[Text document: note.txt]" in unified[0].content
+        assert "Hello from file" in unified[0].content
     
     def test_images_only_extracted_from_user_role(self):
         """
@@ -711,6 +742,57 @@ class TestBuildKiroPayload:
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
         assert "You are helpful" in current_content
         assert "Hello" in current_content
+
+    def test_includes_response_format_json_schema_instruction(self):
+        """
+        What it does: Verifies response_format=json_schema is converted to system instructions.
+        Purpose: Ensure structured output requests influence the Kiro prompt.
+        """
+        print("Setup: Request with response_format json_schema...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[ChatMessage(role="user", content="Return the answer")],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        )
+
+        print("Action: Building payload...")
+        result = build_kiro_payload(request, "conv-123", "")
+
+        print(f"Result: {result}")
+        current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "respond with JSON only" in current_content
+        assert '"name":"answer"' in current_content
+        assert "Return the answer" in current_content
+
+    def test_includes_response_format_json_object_instruction(self):
+        """
+        What it does: Verifies response_format=json_object is converted to system instructions.
+        Purpose: Ensure JSON object mode influences the Kiro prompt.
+        """
+        print("Setup: Request with response_format json_object...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[ChatMessage(role="user", content="Return the answer")],
+            response_format={"type": "json_object"}
+        )
+
+        print("Action: Building payload...")
+        result = build_kiro_payload(request, "conv-123", "")
+
+        print(f"Result: {result}")
+        current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "valid JSON object only" in current_content
+        assert "Return the answer" in current_content
     
     def test_builds_history_for_multi_turn(self):
         """

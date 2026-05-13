@@ -125,6 +125,20 @@ class Tool(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ResponseFormat(BaseModel):
+    """
+    Response format request in OpenAI format.
+
+    Supports json_object and json_schema modes. The gateway maps these to
+    system instructions because Kiro does not expose a native constrained
+    decoding parameter.
+    """
+    type: str
+    json_schema: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
+
+
 class ChatCompletionRequest(BaseModel):
     """
     Request for response generation in OpenAI Chat Completions API format.
@@ -171,6 +185,7 @@ class ChatCompletionRequest(BaseModel):
     # Tools (function calling)
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
+    response_format: Optional[ResponseFormat] = None
     
     # Compatibility fields (ignored)
     stream_options: Optional[Dict[str, Any]] = None

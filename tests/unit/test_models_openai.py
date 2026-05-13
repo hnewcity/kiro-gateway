@@ -24,6 +24,7 @@ from kiro.models_openai import (
     # Tools
     ToolFunction,
     Tool,
+    ResponseFormat,
     # Requests
     ChatCompletionRequest,
     # Responses
@@ -620,6 +621,33 @@ class TestChatCompletionRequest:
         print(f"Comparing tools: Got {request.tools}")
         assert request.tools is not None
         assert len(request.tools) == 1
+
+    def test_accepts_response_format_json_schema(self):
+        """
+        What it does: Verifies response_format is modeled explicitly.
+        Purpose: Ensure structured output requests are not only stored as extra fields.
+        """
+        print("Setup: Creating ChatCompletionRequest with response_format...")
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatMessage(role="user", content="Return JSON")],
+            response_format=ResponseFormat(
+                type="json_schema",
+                json_schema={
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            )
+        )
+
+        print(f"Comparing response_format: Got {request.response_format}")
+        assert request.response_format is not None
+        assert request.response_format.type == "json_schema"
+        assert request.response_format.json_schema["name"] == "answer"
     
     def test_accepts_generation_parameters(self):
         """

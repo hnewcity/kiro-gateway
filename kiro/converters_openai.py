@@ -29,6 +29,7 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -386,6 +387,40 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     return ThinkingConfig(enabled=True, budget_tokens=budget)
 
 
+def _response_format_to_system_prompt(request: ChatCompletionRequest) -> str:
+    """
+    Convert OpenAI response_format into system instructions.
+
+    Kiro does not expose native constrained decoding, so this is a best-effort
+    compatibility layer rather than a hard JSON Schema enforcement mechanism.
+    """
+    response_format = request.response_format
+    if not response_format:
+        return ""
+
+    format_type = response_format.type
+    if format_type == "json_object":
+        return (
+            "You must respond with one valid JSON object only. "
+            "Do not include markdown code fences, comments, explanations, or any text outside the JSON object."
+        )
+
+    if format_type == "json_schema":
+        schema_payload = response_format.json_schema or {}
+        try:
+            schema_text = json.dumps(schema_payload, ensure_ascii=False, separators=(",", ":"))
+        except TypeError:
+            schema_text = str(schema_payload)
+
+        return (
+            "You must respond with JSON only. The response must conform to this JSON Schema request:\n"
+            f"{schema_text}\n"
+            "Do not include markdown code fences, comments, explanations, or any text outside the JSON value."
+        )
+
+    return ""
+
+
 # ==================================================================================================
 # Main Entry Point
 # ==================================================================================================
@@ -414,6 +449,14 @@ def build_kiro_payload(
     """
     # Convert messages to unified format
     system_prompt, unified_messages = convert_openai_messages_to_unified(request_data.messages)
+
+    response_format_prompt = _response_format_to_system_prompt(request_data)
+    if response_format_prompt:
+        system_prompt = (
+            f"{system_prompt}\n\n{response_format_prompt}"
+            if system_prompt
+            else response_format_prompt
+        )
     
     # Convert tools to unified format
     unified_tools = convert_openai_tools_to_unified(request_data.tools)

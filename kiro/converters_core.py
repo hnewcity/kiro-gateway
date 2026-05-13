@@ -30,8 +30,10 @@ The core layer provides a unified interface that API-specific adapters use
 to convert their formats to Kiro API format.
 """
 
+import base64
 import json
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -169,6 +171,9 @@ def extract_text_content(content: Any) -> str:
                 # Skip image and tool_reference blocks - they're handled separately
                 if item.get("type") in ("image", "image_url", "tool_reference"):
                     continue
+                if item.get("type") in ("file", "input_file", "document"):
+                    text_parts.append(extract_document_text_from_content_block(item))
+                    continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
                 elif "text" in item:
@@ -180,6 +185,127 @@ def extract_text_content(content: Any) -> str:
                 text_parts.append(item)
         return "".join(text_parts)
     return str(content)
+
+
+def _parse_data_url(data: str) -> Tuple[Optional[str], str]:
+    """
+    Parse a data URL and return (media_type, payload).
+
+    If the value is not a data URL, the original string is returned as payload.
+    """
+    if not isinstance(data, str) or not data.startswith("data:"):
+        return None, data
+
+    try:
+        header, payload = data.split(",", 1)
+        media_type = header.split(";")[0].replace("data:", "") or None
+        return media_type, payload
+    except ValueError:
+        return None, data
+
+
+def _extract_document_source(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Extract filename, media type, and base64 data from common document blocks.
+    """
+    item_type = item.get("type")
+    filename = item.get("filename")
+    media_type = item.get("media_type")
+    data = item.get("file_data") or item.get("data")
+
+    # OpenAI chat-style file block:
+    # {"type": "file", "file": {"filename": "...", "file_data": "data:application/pdf;base64,..."}}
+    file_obj = item.get("file")
+    if isinstance(file_obj, dict):
+        filename = filename or file_obj.get("filename")
+        media_type = media_type or file_obj.get("media_type")
+        data = data or file_obj.get("file_data") or file_obj.get("data")
+
+    # Anthropic-style document block:
+    # {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "..."}}
+    source = item.get("source")
+    if isinstance(source, dict):
+        filename = filename or source.get("filename")
+        media_type = media_type or source.get("media_type")
+        data = data or source.get("data")
+
+    if isinstance(data, str):
+        data_url_media_type, payload = _parse_data_url(data)
+        media_type = media_type or data_url_media_type
+        data = payload
+
+    if item_type == "input_file":
+        filename = filename or item.get("name")
+
+    return filename, media_type, data
+
+
+def _decode_base64_document(data: str) -> Optional[bytes]:
+    try:
+        return base64.b64decode(data, validate=False)
+    except Exception as e:
+        logger.warning(f"Failed to decode document base64 data: {e}")
+        return None
+
+
+def _extract_pdf_text(data: str) -> str:
+    pdf_bytes = _decode_base64_document(data)
+    if not pdf_bytes:
+        return "[PDF document attached, but its base64 data could not be decoded.]"
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "[PDF document attached, but pypdf is not installed. Install requirements.txt to enable PDF text extraction.]"
+
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        text = "\n".join(part for part in pages if part).strip()
+    except Exception as e:
+        logger.warning(f"Failed to extract text from PDF document: {e}")
+        return "[PDF document attached, but text extraction failed.]"
+
+    if not text:
+        return "[PDF document attached, but no extractable text was found.]"
+
+    max_chars = 200000
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n[PDF text truncated by gateway.]"
+
+    return text
+
+
+def extract_document_text_from_content_block(item: Dict[str, Any]) -> str:
+    """
+    Extract text from supported document content blocks.
+
+    Kiro accepts images natively but not OpenAI file/PDF blocks. For PDFs, the
+    gateway extracts text and appends it to the user message.
+    """
+    filename, media_type, data = _extract_document_source(item)
+    label = filename or "attached document"
+
+    if not data:
+        return f"[Document attached: {label}. No inline data was provided for extraction.]"
+
+    normalized_media_type = (media_type or "").lower()
+    if normalized_media_type == "application/pdf" or label.lower().endswith(".pdf"):
+        text = _extract_pdf_text(data)
+        return f"\n\n[PDF document: {label}]\n{text}\n[/PDF document]\n"
+
+    if normalized_media_type.startswith("text/"):
+        raw = _decode_base64_document(data)
+        if raw is None:
+            return f"[Text document attached: {label}. Base64 decoding failed.]"
+        try:
+            return f"\n\n[Text document: {label}]\n{raw.decode('utf-8', errors='replace')}\n[/Text document]\n"
+        except Exception:
+            return f"[Text document attached: {label}. Text decoding failed.]"
+
+    return f"[Unsupported document attached: {label} ({media_type or 'unknown media type'}).]"
 
 
 def extract_images_from_content(content: Any) -> List[Dict[str, Any]]:
