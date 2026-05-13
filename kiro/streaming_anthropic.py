@@ -606,7 +606,17 @@ async def stream_kiro_to_anthropic(
             )
         
         # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        # tool_use blocks contribute too — for tool-only responses, full_content
+        # and full_thinking_content are empty and the real cost lives in tool name + input.
+        tool_use_text = ""
+        for tb in tool_blocks:
+            tool_use_text += tb.get("name", "") or ""
+            tool_input = tb.get("input", {})
+            try:
+                tool_use_text += json.dumps(tool_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                tool_use_text += str(tool_input)
+        output_tokens = count_tokens(full_content + full_thinking_content + tool_use_text)
 
         # Calculate total tokens from context usage if available
         if context_usage_percentage is not None:
@@ -775,7 +785,20 @@ async def collect_anthropic_response(
         })
     
     # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    # tool_use blocks contribute too — name + serialized input.
+    tool_use_text = ""
+    for tc in result.tool_calls:
+        tool_name = tc.get("function", {}).get("name", "") or tc.get("name", "") or ""
+        tool_input = tc.get("function", {}).get("arguments", {}) or tc.get("input", {})
+        tool_use_text += tool_name
+        if isinstance(tool_input, str):
+            tool_use_text += tool_input
+        else:
+            try:
+                tool_use_text += json.dumps(tool_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                tool_use_text += str(tool_input)
+    output_tokens = count_tokens(result.content + result.thinking_content + tool_use_text)
 
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
