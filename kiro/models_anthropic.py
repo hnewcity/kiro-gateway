@@ -183,11 +183,14 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic spec only allows user/assistant, but newer
+            Claude Code clients sometimes inline "system" messages in the array.
+            We accept it here and let normalize_message_roles() in converters_core
+            collapse it to "user" downstream.
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

@@ -339,8 +339,8 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies an unknown message role is rejected.
+        Purpose: AnthropicMessage.role is a Literal of user/assistant/system.
         """
         print("Action: POST /v1/messages with invalid role...")
         response = test_client.post(
@@ -352,11 +352,34 @@ class TestMessagesValidation:
                 "messages": [{"role": "invalid_role", "content": "Hello"}]
             }
         )
-        
+
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
         assert response.status_code == 422
-    
+
+    def test_accepts_inline_system_role_in_messages(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Newer Claude Code clients sometimes inline a system message
+            inside the messages array. The gateway must accept it (downstream
+            normalize_message_roles collapses it to "user").
+        Purpose: Regression for the 422 returned when role="system" appeared in messages[1].
+        """
+        print("Action: POST /v1/messages with role=system in messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "system", "content": "context blob"},
+                ],
+            },
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
         What it does: Verifies valid request format passes validation.
