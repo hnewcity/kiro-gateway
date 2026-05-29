@@ -46,6 +46,7 @@ from kiro.config import (
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
+    get_kiro_list_profiles_host,
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
@@ -946,6 +947,55 @@ class KiroAuthManager:
             await self._refresh_token_request()
             return self._access_token
     
+    async def fetch_profile_arn(self) -> None:
+        """
+        Fetches profileArn from ListAvailableProfiles for Enterprise IdC accounts.
+
+        Only runs when is_enterprise_ide is True and no profileArn is already known.
+        Uses q.{region}.amazonaws.com — runtime.kiro.dev does not serve this operation.
+        Selects the first returned profile and caches it in self._profile_arn.
+        """
+        if self._profile_arn:
+            return
+        if not self.is_enterprise_ide:
+            return
+
+        token = await self.get_access_token()
+        sso_region = self._sso_region or self._region
+        url = get_kiro_list_profiles_host(sso_region) + "/"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "Content-Encoding": "amz-1.0",
+            "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
+            "User-Agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{self._fingerprint}",
+            "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{self._fingerprint}",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(url, headers=headers, content=json.dumps({"nextToken": None}).encode())
+
+            if response.status_code != 200:
+                logger.warning(f"ListAvailableProfiles returned {response.status_code}: {response.text[:300]}")
+                return
+
+            data = response.json()
+            profiles = data.get("profiles", [])
+            if not profiles:
+                logger.warning("ListAvailableProfiles returned empty profiles list — cannot resolve profileArn")
+                return
+
+            self._profile_arn = profiles[0].get("arn") or profiles[0].get("profileArn")
+            if self._profile_arn:
+                logger.info(f"profileArn resolved via ListAvailableProfiles: profile={profiles[0].get('profileName', '?')}")
+                self._save_credentials_to_file()
+            else:
+                logger.warning(f"ListAvailableProfiles: first profile has no arn field: {profiles[0]}")
+
+        except Exception as e:
+            logger.warning(f"fetch_profile_arn failed (will proceed without profileArn): {e}")
+
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""

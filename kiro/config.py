@@ -184,6 +184,10 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host for ListAvailableProfiles (Enterprise IdC profile discovery)
+# runtime.kiro.dev only serves GenerateAssistantResponse; profile listing lives on q.amazonaws.com
+KIRO_LIST_PROFILES_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -578,4 +582,9 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_list_profiles_host(region: str) -> str:
+    """Return host for ListAvailableProfiles (Enterprise IdC profile discovery)."""
+    return KIRO_LIST_PROFILES_HOST_TEMPLATE.format(region=region)
 

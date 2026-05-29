@@ -496,7 +496,11 @@ class AccountManager:
             
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
-            
+
+            # For Enterprise IdC accounts, profileArn is not in the creds file —
+            # fetch it dynamically so runtime.kiro.dev requests don't 400.
+            await auth_manager.fetch_profile_arn()
+
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
                 # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)

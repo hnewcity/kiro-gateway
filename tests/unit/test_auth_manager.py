@@ -2971,6 +2971,132 @@ class TestKiroAuthManagerEnterpriseIDE:
         print("TestKiroAuthManagerSsoRegionSeparation class.")
         assert True  # Documentation test
 
+    @pytest.mark.asyncio
+    async def test_fetch_profile_arn_success(self, tmp_path, monkeypatch):
+        """
+        What it does: fetch_profile_arn() calls ListAvailableProfiles and stores the ARN.
+        Purpose: Enterprise IdC creds have no profileArn in file; gateway fetches it dynamically.
+        """
+        monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
+
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "accessToken": "test_access_token",
+            "refreshToken": "test_refresh_token",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+            "clientIdHash": "abc123def456",
+        }))
+        aws_dir = tmp_path / ".aws" / "sso" / "cache"
+        aws_dir.mkdir(parents=True, exist_ok=True)
+        (aws_dir / "abc123def456.json").write_text(json.dumps({
+            "clientId": "ent_client_id",
+            "clientSecret": "ent_client_secret",
+            "region": "us-east-1",
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        assert manager._profile_arn is None
+        assert manager.is_enterprise_ide is True
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={
+            "profiles": [
+                {"arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE",
+                 "profileName": "TestProfile"}
+            ]
+        })
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await manager.fetch_profile_arn()
+
+        assert manager._profile_arn == "arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE"
+
+        # Correct target + host were used
+        call = mock_client.post.call_args
+        assert call.kwargs["headers"]["X-Amz-Target"] == "AmazonCodeWhispererService.ListAvailableProfiles"
+        assert "q.us-east-1.amazonaws.com" in call.args[0]
+
+    @pytest.mark.asyncio
+    async def test_fetch_profile_arn_skips_when_already_set(self, temp_enterprise_ide_complete):
+        """
+        What it does: fetch_profile_arn() is a no-op when profileArn is already known.
+        Purpose: Avoid an unnecessary network call when the creds file already has the ARN.
+        """
+        creds_file, _ = temp_enterprise_ide_complete
+        manager = KiroAuthManager(creds_file=creds_file)
+        assert manager._profile_arn is not None  # fixture provides profileArn
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            await manager.fetch_profile_arn()
+            mock_client_class.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_profile_arn_skips_non_enterprise(self, tmp_path):
+        """
+        What it does: fetch_profile_arn() is a no-op for non-enterprise (Kiro Desktop) accounts.
+        Purpose: Only Enterprise IdC accounts need dynamic profile discovery.
+        """
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "refreshToken": "desktop_refresh_token",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+        }))
+        manager = KiroAuthManager(creds_file=str(creds_file))
+        assert manager.is_enterprise_ide is False
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            await manager.fetch_profile_arn()
+            mock_client_class.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_profile_arn_handles_empty_profiles(self, tmp_path, monkeypatch):
+        """
+        What it does: fetch_profile_arn() does not crash and leaves profile_arn unset on empty list.
+        Purpose: Graceful degradation when the account has no profiles configured.
+        """
+        monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
+
+        creds_file = tmp_path / "kiro-auth-token.json"
+        creds_file.write_text(json.dumps({
+            "accessToken": "test_access_token",
+            "refreshToken": "test_refresh_token",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1",
+            "clientIdHash": "abc123def456",
+        }))
+        aws_dir = tmp_path / ".aws" / "sso" / "cache"
+        aws_dir.mkdir(parents=True, exist_ok=True)
+        (aws_dir / "abc123def456.json").write_text(json.dumps({
+            "clientId": "ent_client_id",
+            "clientSecret": "ent_client_secret",
+        }))
+
+        manager = KiroAuthManager(creds_file=str(creds_file))
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={"profiles": []})
+
+        with patch('kiro.auth.httpx.AsyncClient') as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            await manager.fetch_profile_arn()
+
+        assert manager._profile_arn is None
+
 
 # =============================================================================
 # Tests for SQLite write-back preserving unknown fields (Issue #131)
