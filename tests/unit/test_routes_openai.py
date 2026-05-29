@@ -16,13 +16,14 @@ For Anthropic API tests, see test_routes_anthropic.py.
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime, timezone
+from types import SimpleNamespace
 import json
 import time
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from kiro.routes_openai import verify_api_key, router
+from kiro.routes_openai import chat_completions, verify_api_key, router
 from kiro.config import PROXY_API_KEY, APP_VERSION
 
 
@@ -977,6 +978,100 @@ class TestHTTPClientSelection:
         assert call_args[1]['shared_client'] is not None, \
             "Non-streaming should use shared client"
         print("✅ Non-streaming correctly uses shared client")
+
+
+class TestChatCompletionsProfileArnSelection:
+    """Tests for profileArn selection in /v1/chat/completions payload construction."""
+
+    def _request_context(self, auth_manager):
+        """
+        Build minimal request context for direct route invocation.
+
+        Args:
+            auth_manager: Auth manager to expose through the selected account.
+
+        Returns:
+            Request-like object with app.state populated.
+        """
+        account = SimpleNamespace(
+            auth_manager=auth_manager,
+            model_cache=MagicMock(),
+            model_resolver=MagicMock(),
+        )
+        account_manager = MagicMock()
+        account_manager.get_first_account.return_value = account
+        return SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    account_system=False,
+                    account_manager=account_manager,
+                    http_client=MagicMock(),
+                )
+            )
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_chat_completions_uses_desktop_profile_arn_for_streaming_modes(self, stream):
+        """
+        What it does: Verifies Kiro Desktop profileArn is passed to converter.
+        Purpose: Ensure OpenAI streaming and non-streaming paths include profileArn.
+        """
+        print(f"Setup: Creating Kiro Desktop request with stream={stream}...")
+        from kiro.auth import KiroAuthManager
+        from kiro.models_openai import ChatCompletionRequest
+
+        auth_manager = KiroAuthManager(
+            refresh_token="test_refresh",
+            profile_arn="arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+        )
+        request = self._request_context(auth_manager)
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=stream,
+        )
+
+        print("Action: Calling chat_completions route with converter patched...")
+        with patch("kiro.routes_openai.build_kiro_payload", side_effect=ValueError("stop")) as mock_converter:
+            with pytest.raises(HTTPException) as exc_info:
+                await chat_completions(request, request_data)
+
+        print("Checking: Converter received Kiro Desktop profile ARN...")
+        assert exc_info.value.status_code == 400
+        assert mock_converter.call_args.args[2] == auth_manager.profile_arn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_chat_completions_omits_aws_sso_profile_arn_for_streaming_modes(self, stream):
+        """
+        What it does: Verifies AWS SSO profileArn is not passed to converter.
+        Purpose: Preserve known-good AWS SSO behavior across OpenAI modes.
+        """
+        print(f"Setup: Creating AWS SSO request with stream={stream}...")
+        from kiro.auth import AuthType, KiroAuthManager
+        from kiro.models_openai import ChatCompletionRequest
+
+        auth_manager = KiroAuthManager(
+            refresh_token="test_refresh",
+            profile_arn="arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+        )
+        auth_manager._auth_type = AuthType.AWS_SSO_OIDC
+        request = self._request_context(auth_manager)
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=stream,
+        )
+
+        print("Action: Calling chat_completions route with converter patched...")
+        with patch("kiro.routes_openai.build_kiro_payload", side_effect=ValueError("stop")) as mock_converter:
+            with pytest.raises(HTTPException) as exc_info:
+                await chat_completions(request, request_data)
+
+        print("Checking: Converter received empty profile ARN...")
+        assert exc_info.value.status_code == 400
+        assert mock_converter.call_args.args[2] == ""
 
 
 # =============================================================================

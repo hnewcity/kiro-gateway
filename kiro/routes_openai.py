@@ -37,19 +37,19 @@ from loguru import logger
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
-    PROFILE_ARN,
 )
 from kiro.models_openai import (
     OpenAIModel,
     ModelList,
     ChatCompletionRequest,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
+from kiro.profile_arn import profile_arn_for_payload
 from kiro.utils import generate_conversation_id, get_kiro_headers
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -358,14 +358,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            selected_profile_arn = profile_arn_for_payload(auth_manager)
             
             try:
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    selected_profile_arn
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -606,14 +605,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    selected_profile_arn = profile_arn_for_payload(auth_manager)
     
     try:
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            selected_profile_arn
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

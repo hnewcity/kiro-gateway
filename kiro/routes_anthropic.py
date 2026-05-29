@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import PROXY_API_KEY
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -42,7 +42,7 @@ from kiro.models_anthropic import (
     AnthropicErrorResponse,
     AnthropicErrorDetail,
 )
-from kiro.auth import KiroAuthManager, AuthType
+from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.streaming_anthropic import (
@@ -51,6 +51,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
+from kiro.profile_arn import profile_arn_for_payload
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import count_message_tokens, count_tools_tokens
 from kiro.config import WEB_SEARCH_ENABLED
@@ -378,14 +379,13 @@ async def messages(
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            # profileArn is required by runtime.kiro.dev for all auth types
-            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+            selected_profile_arn = profile_arn_for_payload(auth_manager)
             
             try:
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    selected_profile_arn
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -677,14 +677,13 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is required by runtime.kiro.dev for all auth types
-    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
+    selected_profile_arn = profile_arn_for_payload(auth_manager)
     
     try:
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            selected_profile_arn
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")

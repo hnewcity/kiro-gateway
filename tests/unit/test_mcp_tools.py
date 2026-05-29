@@ -251,6 +251,83 @@ class TestCallKiroMCPAPI:
         assert tool_use_id is None
         assert results is None
 
+    @pytest.mark.asyncio
+    async def test_mcp_request_includes_profile_arn_for_kiro_desktop(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is added to the top-level MCP request body
+        for Kiro Desktop accounts with a profile ARN.
+        Purpose: Ensure Enterprise MCP web_search calls include required profileArn.
+        """
+        print("Setup: Mocking successful MCP response and capturing request body...")
+        query = "Python"
+        mock_response_data = {
+            "id": "web_search_tooluse_abc123_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Checking: profileArn is present at top level only...")
+        sent_body = mock_post.await_args.kwargs["json"]
+        assert sent_body.get("profileArn") == mock_auth_manager.profile_arn
+        assert "profileArn" not in sent_body.get("params", {})
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_omits_profile_arn_for_aws_sso(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn is not added for AWS SSO OIDC accounts.
+        Purpose: Avoid sending profileArn on non-Kiro-Desktop MCP requests.
+        """
+        print("Setup: Switching auth manager to AWS SSO with a discovered profile ARN...")
+        from kiro.auth import AuthType
+
+        mock_auth_manager._auth_type = AuthType.AWS_SSO_OIDC
+        assert mock_auth_manager.profile_arn
+
+        query = "Python"
+        mock_response_data = {
+            "id": "web_search_tooluse_abc123_1234567890_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"results": [], "totalResults": 0, "query": query})
+                }],
+                "isError": False
+            }
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        print("Checking: profileArn is absent from MCP request body...")
+        sent_body = mock_post.await_args.kwargs["json"]
+        assert "profileArn" not in sent_body
+
 
 # ==================================================================================================
 # Tests for Search Summary Generation

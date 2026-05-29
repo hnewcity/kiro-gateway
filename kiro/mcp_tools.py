@@ -40,6 +40,7 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.profile_arn import profile_arn_for_payload
 from kiro.tokenizer import count_message_tokens, count_tokens
 
 # Import debug_logger
@@ -135,6 +136,10 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    selected_profile_arn = profile_arn_for_payload(auth_manager)
+    if selected_profile_arn:
+        mcp_request["profileArn"] = selected_profile_arn
     
     # Log MCP request
     try:
@@ -161,7 +166,7 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - {response.text[:500]}")
                 return None, None
             
             mcp_response = response.json()
