@@ -819,7 +819,7 @@ class TestBuildKiroPayload:
     def test_handles_assistant_as_last_message(self):
         """
         What it does: Verifies handling of assistant as last message.
-        Purpose: Ensure "Continue" message is created.
+        Purpose: Ensure "(empty placeholder)" message is created.
         """
         print("Setup: Request with assistant at the end...")
         request = ChatCompletionRequest(
@@ -835,7 +835,7 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "Continue"
+        assert current_content == "(empty placeholder)"
     
     def test_raises_for_empty_messages(self):
         """
@@ -857,8 +857,8 @@ class TestBuildKiroPayload:
     
     def test_uses_continue_for_empty_content(self):
         """
-        What it does: Verifies using "Continue" for empty content.
-        Purpose: Ensure empty message is replaced with "Continue".
+        What it does: Verifies using "(empty placeholder)" for empty content.
+        Purpose: Ensure empty message is replaced with "(empty placeholder)".
         """
         print("Setup: Request with empty content...")
         request = ChatCompletionRequest(
@@ -873,7 +873,7 @@ class TestBuildKiroPayload:
 
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "Continue"
+        assert current_content == "(empty placeholder)"
     
     def test_normalizes_model_id_correctly(self):
         """

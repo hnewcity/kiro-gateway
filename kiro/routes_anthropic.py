@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY
+from kiro.config import PROXY_API_KEY, PROFILE_ARN
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -354,7 +354,7 @@ async def messages(
                     # Multiple accounts - generic error with context
                     detail = "No available accounts for this model."
                     if last_error_message:
-                        detail += f" Last error: {last_error_message}"
+                        detail += f" Error from last account: {last_error_message}"
                     return JSONResponse(
                         status_code=503,
                         content={
@@ -378,9 +378,8 @@ async def messages(
             conversation_id = generate_conversation_id()
             
             # Build payload for Kiro
-            profile_arn_for_payload = ""
-            if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-                profile_arn_for_payload = auth_manager.profile_arn
+            # profileArn is required by runtime.kiro.dev for all auth types
+            profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
             
             try:
                 kiro_payload = anthropic_to_kiro(
@@ -637,7 +636,7 @@ async def messages(
             # Multiple accounts - generic error with context
             detail = "All accounts failed after full circle."
             if last_error_message:
-                detail += f" Last error: {last_error_message}"
+                detail += f" Error from last account: {last_error_message}"
             return JSONResponse(
                 status_code=503,
                 content={
@@ -678,10 +677,8 @@ async def messages(
     conversation_id = generate_conversation_id()
     
     # Build payload for Kiro
-    # profileArn is only needed for Kiro Desktop auth
-    profile_arn_for_payload = ""
-    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-        profile_arn_for_payload = auth_manager.profile_arn
+    # profileArn is required by runtime.kiro.dev for all auth types
+    profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
     
     try:
         kiro_payload = anthropic_to_kiro(

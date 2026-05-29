@@ -64,6 +64,35 @@ from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
 
 
+def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
+    """
+    Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
+    
+    Runtime endpoint pattern: https://runtime.{region}.kiro.dev
+    Old endpoint pattern: https://q.{region}.amazonaws.com
+    
+    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
+    
+    Args:
+        auth_manager: KiroAuthManager instance
+    
+    Returns:
+        True if using runtime endpoint, False otherwise
+    
+    Examples:
+        >>> auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+        >>> _is_runtime_endpoint(auth_manager)
+        True
+        >>> auth_manager.api_host = "https://runtime.eu-central-1.kiro.dev"
+        >>> _is_runtime_endpoint(auth_manager)
+        True
+        >>> auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
+        >>> _is_runtime_endpoint(auth_manager)
+        False
+    """
+    return "://runtime." in auth_manager.api_host
+
+
 def _format_duration(seconds: float) -> str:
     """
     Format duration in human-readable format.
@@ -468,40 +497,48 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Fetch models list with retry + fallback
-            params = {"origin": "AI_EDITOR"}
-            if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-                params["profileArn"] = auth_manager.profile_arn
-            
-            list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-            
-            # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
-            http_client = KiroHttpClient(auth_manager, shared_client=None)
-            
-            try:
-                response = await http_client.request_with_retry(
-                    method="GET",
-                    url=list_models_url,
-                    json_data=None,
-                    params=params,
-                    stream=False
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    models_list = data.get("models", [])
-                else:
-                    # Shouldn't happen (retry handles non-200), but keep for safety
-                    raise Exception(f"HTTP {response.status_code}")
-            
-            except Exception as e:
-                # All retries exhausted - use fallback
-                logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
-                logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
+            # Determine if we should fetch models or use static list
+            if _is_runtime_endpoint(auth_manager):
+                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
+                # Use static list without attempting request
+                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
                 models_list = FALLBACK_MODELS
-            
-            finally:
-                await http_client.close()
+            else:
+                # Old endpoint - attempt to fetch dynamic model list
+                # Fetch models list with retry + fallback
+                params = {"origin": "AI_EDITOR"}
+                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                    params["profileArn"] = auth_manager.profile_arn
+                
+                list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
+                
+                # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
+                http_client = KiroHttpClient(auth_manager, shared_client=None)
+                
+                try:
+                    response = await http_client.request_with_retry(
+                        method="GET",
+                        url=list_models_url,
+                        json_data=None,
+                        params=params,
+                        stream=False
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        models_list = data.get("models", [])
+                    else:
+                        # Shouldn't happen (retry handles non-200), but keep for safety
+                        raise Exception(f"HTTP {response.status_code}")
+                
+                except Exception as e:
+                    # All retries exhausted - use fallback
+                    logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
+                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
+                    models_list = FALLBACK_MODELS
+                
+                finally:
+                    await http_client.close()
             
             # Create model cache and update
             model_cache = ModelInfoCache()
@@ -552,6 +589,17 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
+        # Check if using runtime endpoint (no dynamic model list available)
+        if _is_runtime_endpoint(account.auth_manager):
+            # Runtime endpoint does not provide /ListAvailableModels
+            # Use static list and update cache timestamp
+            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
+            await account.model_cache.update(FALLBACK_MODELS)
+            account.models_cached_at = time.time()
+            self._dirty = True
+            return
+        
+        # Old endpoint - attempt to fetch dynamic model list
         # Use KiroHttpClient for retry logic
         http_client = KiroHttpClient(account.auth_manager, shared_client=None)
         
@@ -638,15 +686,15 @@ class AccountManager:
                             await self._refresh_account_models(account_id)
                         except Exception as e:
                             logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                
-                # Validate model availability
-                if account.model_resolver:
-                    normalized_model = normalize_model_name(model)
-                    available_models = account.model_resolver.get_available_models()
-                    if normalized_model not in available_models:
-                        return None
+                # # Validate model availability
+                # if account.model_resolver:
+                #     normalized_model = normalize_model_name(model)
+                #     available_models = account.model_resolver.get_available_models()
+                #     if normalized_model not in available_models:
+                #         return None
                 
                 # Always return single account (ignore cooldown/failures)
+                # No model validation - let Kiro API decide (gateway, not gatekeeper)
                 return account
             
             # Multi-account logic: GLOBAL sticky
@@ -702,12 +750,12 @@ class AccountManager:
                             await self._refresh_account_models(account_id)
                         except Exception as e:
                             logger.warning(f"Failed to refresh models for {account_id}: {e}")
+                # # Check if model is available on this account
+                # available_models = account.model_resolver.get_available_models()
+                # if normalized_model not in available_models:
+                #     continue
                 
-                # Check if model is available on this account
-                available_models = account.model_resolver.get_available_models()
-                if normalized_model not in available_models:
-                    continue
-                
+                # No model validation - let Kiro API decide (gateway, not gatekeeper)
                 # Account is suitable!
                 return account
             
@@ -716,7 +764,7 @@ class AccountManager:
     
     async def report_success(self, account_id: str, model: str) -> None:
         """
-        Report successful request (reset failures, update stats, sticky).
+        Report successful request (reset failures, update stats, sticky, dynamic learning).
         
         Args:
             account_id: Account ID
@@ -736,6 +784,17 @@ class AccountManager:
             account.stats.total_requests += 1
             account.stats.successful_requests += 1
             self._dirty = True
+            
+            # Dynamic learning: add model to mapping if successful
+            # This allows system to learn about new models not in FALLBACK_MODELS
+            normalized_model = normalize_model_name(model)
+            if normalized_model not in self._model_to_accounts:
+                self._model_to_accounts[normalized_model] = ModelAccountList()
+                logger.debug(f"Dynamic learning: discovered new model '{normalized_model}'")
+            if account_id not in self._model_to_accounts[normalized_model].accounts:
+                self._model_to_accounts[normalized_model].accounts.append(account_id)
+                logger.debug(f"Dynamic learning: model '{normalized_model}' works on account {account_id}")
+                self._dirty = True
             
             # GLOBAL STICKY: Update global current_account_index
             all_account_ids = list(self._accounts.keys())
@@ -768,6 +827,18 @@ class AccountManager:
         async with self._lock:
             account = self._accounts.get(account_id)
             if not account:
+                return
+            
+            # Special case: INVALID_MODEL_ID is discovery process, not account failure
+            # Account is healthy, model is just not available on this account
+            # Log for user visibility but don't penalize account statistics
+            if reason == "INVALID_MODEL_ID":
+                account.stats.total_requests += 1
+                self._dirty = True
+                logger.warning(
+                    f"Model '{model}' not available on account {account_id}: "
+                    f"status={status_code}, reason={reason}"
+                )
                 return
             
             # Update failure count (only for RECOVERABLE)
