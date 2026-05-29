@@ -2197,8 +2197,8 @@ class TestMessagesProfileArnSelection:
     @pytest.mark.parametrize("stream", [False, True])
     async def test_messages_omits_aws_sso_profile_arn_for_streaming_modes(self, stream):
         """
-        What it does: Verifies AWS SSO profileArn is not passed to converter.
-        Purpose: Preserve known-good AWS SSO behavior across Anthropic modes.
+        What it does: Verifies plain AWS SSO profileArn is not passed to converter.
+        Purpose: Preserve known-good kiro-cli AWS SSO behavior across Anthropic modes.
         """
         print(f"Setup: Creating AWS SSO request with stream={stream}...")
         from kiro.auth import AuthType, KiroAuthManager
@@ -2224,6 +2224,39 @@ class TestMessagesProfileArnSelection:
         print("Checking: Converter received empty profile ARN...")
         assert response.status_code == 400
         assert mock_converter.call_args.args[2] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_messages_uses_enterprise_ide_profile_arn_for_streaming_modes(self, stream):
+        """
+        What it does: Verifies Enterprise Kiro IDE OIDC profileArn is passed to converter.
+        Purpose: Enterprise IDE uses OIDC refresh but runtime still requires profileArn.
+        """
+        print(f"Setup: Creating Enterprise Kiro IDE request with stream={stream}...")
+        from kiro.auth import AuthType, KiroAuthManager
+        from kiro.models_anthropic import AnthropicMessagesRequest
+
+        auth_manager = KiroAuthManager(
+            refresh_token="test_refresh",
+            profile_arn="arn:aws:codewhisperer:us-east-1:123456789:profile/enterprise",
+        )
+        auth_manager._auth_type = AuthType.AWS_SSO_OIDC
+        auth_manager._client_id_hash = "abc123def456"
+        request = self._request_context(auth_manager)
+        request_data = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=stream,
+        )
+
+        print("Action: Calling messages route with converter patched...")
+        with patch("kiro.routes_anthropic.anthropic_to_kiro", side_effect=ValueError("stop")) as mock_converter:
+            response = await messages(request, request_data)
+
+        print("Checking: Converter received Enterprise profile ARN...")
+        assert response.status_code == 400
+        assert mock_converter.call_args.args[2] == auth_manager.profile_arn
 
 
 # ==================================================================================================

@@ -47,16 +47,34 @@ class TestProfileArnForPayload:
 
     def test_returns_empty_string_for_aws_sso_even_with_profile_arn(self):
         """
-        What it does: Verifies AWS SSO OIDC accounts do not send profileArn.
-        Purpose: Preserve the known-good behavior from the runtime migration.
+        What it does: Verifies plain AWS SSO OIDC accounts do not send profileArn.
+        Purpose: Preserve known-good kiro-cli behavior from the runtime migration.
         """
         print("Setup: Creating AWS SSO auth manager with discovered profile ARN...")
         auth_manager = MagicMock()
         auth_manager.auth_type = AuthType.AWS_SSO_OIDC
         auth_manager.profile_arn = "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+        auth_manager.is_enterprise_ide = False
 
         print("Action: Selecting profileArn for payload...")
         result = profile_arn_for_payload(auth_manager)
 
         print(f"Comparing result: Expected empty string, Got '{result}'")
         assert result == ""
+
+    def test_returns_profile_arn_for_enterprise_ide_oidc(self):
+        """
+        What it does: Verifies Enterprise Kiro IDE OIDC accounts send profileArn.
+        Purpose: Enterprise IDE refreshes through OIDC but runtime still needs profileArn.
+        """
+        print("Setup: Creating Enterprise Kiro IDE auth manager...")
+        auth_manager = MagicMock()
+        auth_manager.auth_type = AuthType.AWS_SSO_OIDC
+        auth_manager.profile_arn = "arn:aws:codewhisperer:us-east-1:123456789:profile/enterprise"
+        auth_manager.is_enterprise_ide = True
+
+        print("Action: Selecting profileArn for payload...")
+        result = profile_arn_for_payload(auth_manager)
+
+        print(f"Comparing result: Expected Enterprise profile ARN, Got '{result}'")
+        assert result == auth_manager.profile_arn

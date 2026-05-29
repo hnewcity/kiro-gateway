@@ -4,8 +4,9 @@
 Profile ARN selection for Kiro runtime payloads.
 
 Kiro Desktop credentials use a CodeWhisperer profile ARN in
-generateAssistantResponse payloads. AWS SSO OIDC credentials must not send
-profileArn, even if a local credential source exposes one.
+generateAssistantResponse payloads. Enterprise Kiro IDE uses AWS SSO OIDC for
+token refresh but still requires profileArn in runtime payloads. Plain kiro-cli
+AWS SSO OIDC requests should not send profileArn.
 """
 
 from typing import Optional, Protocol
@@ -26,6 +27,11 @@ class ProfileArnCarrier(Protocol):
         """AWS CodeWhisperer profile ARN if available."""
         ...
 
+    @property
+    def is_enterprise_ide(self) -> bool:
+        """Whether the account is Enterprise Kiro IDE."""
+        ...
+
 
 def profile_arn_for_payload(auth_manager: ProfileArnCarrier) -> str:
     """
@@ -35,10 +41,14 @@ def profile_arn_for_payload(auth_manager: ProfileArnCarrier) -> str:
         auth_manager: Auth manager for the selected account.
 
     Returns:
-        The Kiro Desktop profile ARN, or an empty string when the selected
-        account should not send profileArn.
+        The profile ARN for Kiro Desktop or Enterprise Kiro IDE accounts, or an
+        empty string when the selected account should not send profileArn.
     """
-    if auth_manager.auth_type != AuthType.KIRO_DESKTOP:
+    should_send_profile_arn = (
+        auth_manager.auth_type == AuthType.KIRO_DESKTOP
+        or getattr(auth_manager, "is_enterprise_ide", False)
+    )
+    if not should_send_profile_arn:
         return ""
 
     return auth_manager.profile_arn or ""

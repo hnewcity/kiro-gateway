@@ -975,3 +975,8 @@ class KiroAuthManager:
     def auth_type(self) -> AuthType:
         """Authentication type (KIRO_DESKTOP or AWS_SSO_OIDC)."""
         return self._auth_type
+
+    @property
+    def is_enterprise_ide(self) -> bool:
+        """Whether credentials came from Enterprise Kiro IDE clientIdHash flow."""
+        return bool(self._client_id_hash)
