@@ -88,6 +88,7 @@ from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+from extensions.tool_name_alias import install_tool_name_aliasing
 
 
 # --- Loguru Configuration ---
@@ -332,6 +333,9 @@ async def lifespan(app: FastAPI):
     concurrent requests efficiently (fixes issue #24).
     """
     logger.info("Starting application... Creating state managers.")
+
+    # Install tool-name aliasing patch (handles MCP tool names exceeding Kiro's 64-char limit)
+    install_tool_name_aliasing()
     
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests
