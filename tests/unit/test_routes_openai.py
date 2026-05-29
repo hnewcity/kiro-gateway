@@ -1045,8 +1045,12 @@ class TestChatCompletionsProfileArnSelection:
     @pytest.mark.parametrize("stream", [False, True])
     async def test_chat_completions_omits_aws_sso_profile_arn_for_streaming_modes(self, stream):
         """
-        What it does: Verifies plain AWS SSO profileArn is not passed to converter.
-        Purpose: Preserve known-good kiro-cli AWS SSO behavior across OpenAI modes.
+        What it does: Verifies AWS SSO profileArn is passed to converter.
+        Purpose: After the runtime.kiro.dev migration, profileArn is required
+            for all auth types — including plain kiro-cli AWS SSO OIDC. The
+            legacy q.amazonaws.com endpoint used to reject profileArn for SSO,
+            but runtime requires it (test name kept for history; see
+            kiro/profile_arn.py).
         """
         print(f"Setup: Creating AWS SSO request with stream={stream}...")
         from kiro.auth import AuthType, KiroAuthManager
@@ -1069,9 +1073,9 @@ class TestChatCompletionsProfileArnSelection:
             with pytest.raises(HTTPException) as exc_info:
                 await chat_completions(request, request_data)
 
-        print("Checking: Converter received empty profile ARN...")
+        print("Checking: Converter received AWS SSO profile ARN...")
         assert exc_info.value.status_code == 400
-        assert mock_converter.call_args.args[2] == ""
+        assert mock_converter.call_args.args[2] == auth_manager.profile_arn
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stream", [False, True])

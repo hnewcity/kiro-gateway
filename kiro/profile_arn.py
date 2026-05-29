@@ -3,19 +3,24 @@
 """
 Profile ARN selection for Kiro runtime payloads.
 
-Kiro Desktop credentials use a CodeWhisperer profile ARN in
-generateAssistantResponse payloads. Enterprise Kiro IDE uses AWS SSO OIDC for
-token refresh but still requires profileArn in runtime payloads. Plain kiro-cli
-AWS SSO OIDC requests should not send profileArn.
+Since the migration to runtime.kiro.dev (upstream commits 07d24fc, 90d0509),
+profileArn is required for ALL auth types — Kiro Desktop, kiro-cli AWS SSO
+OIDC, and Enterprise Kiro IDE. The previous gating that stripped profileArn
+for plain SSO OIDC requests applied only to the legacy q.amazonaws.com
+endpoint and now causes 400 "profileArn is required" errors against runtime.
+
+Falls back to the PROFILE_ARN environment variable if the auth manager has no
+profile ARN of its own.
 """
 
 from typing import Optional, Protocol
 
 from kiro.auth import AuthType
+from kiro.config import PROFILE_ARN
 
 
 class ProfileArnCarrier(Protocol):
-    """Auth object fields needed to decide whether profileArn is allowed."""
+    """Auth object fields needed to resolve the profileArn for a payload."""
 
     @property
     def auth_type(self) -> AuthType:
@@ -27,28 +32,16 @@ class ProfileArnCarrier(Protocol):
         """AWS CodeWhisperer profile ARN if available."""
         ...
 
-    @property
-    def is_enterprise_ide(self) -> bool:
-        """Whether the account is Enterprise Kiro IDE."""
-        ...
-
 
 def profile_arn_for_payload(auth_manager: ProfileArnCarrier) -> str:
     """
-    Return the profile ARN that should be sent to Kiro runtime.
+    Return the profileArn that should be sent to runtime.kiro.dev.
 
     Args:
         auth_manager: Auth manager for the selected account.
 
     Returns:
-        The profile ARN for Kiro Desktop or Enterprise Kiro IDE accounts, or an
-        empty string when the selected account should not send profileArn.
+        The auth manager's profile ARN, falling back to the PROFILE_ARN env
+        variable, or an empty string if neither is available.
     """
-    should_send_profile_arn = (
-        auth_manager.auth_type == AuthType.KIRO_DESKTOP
-        or getattr(auth_manager, "is_enterprise_ide", False)
-    )
-    if not should_send_profile_arn:
-        return ""
-
-    return auth_manager.profile_arn or ""
+    return auth_manager.profile_arn or PROFILE_ARN or ""

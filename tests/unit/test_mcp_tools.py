@@ -291,8 +291,12 @@ class TestCallKiroMCPAPI:
     @pytest.mark.asyncio
     async def test_mcp_request_omits_profile_arn_for_aws_sso(self, mock_auth_manager):
         """
-        What it does: Verifies profileArn is not added for plain AWS SSO OIDC accounts.
-        Purpose: Avoid sending profileArn on non-Enterprise kiro-cli MCP requests.
+        What it does: Verifies profileArn is added for AWS SSO OIDC accounts.
+        Purpose: After the runtime.kiro.dev migration, profileArn is required
+            for all auth types — including plain kiro-cli AWS SSO. The legacy
+            q.amazonaws.com endpoint used to reject profileArn for SSO, but
+            runtime requires it (test name kept for history; see
+            kiro/profile_arn.py).
         """
         print("Setup: Switching auth manager to AWS SSO with a discovered profile ARN...")
         from kiro.auth import AuthType
@@ -324,9 +328,9 @@ class TestCallKiroMCPAPI:
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             await call_kiro_mcp_api(query, mock_auth_manager)
 
-        print("Checking: profileArn is absent from MCP request body...")
+        print("Checking: profileArn is present in MCP request body...")
         sent_body = mock_post.await_args.kwargs["json"]
-        assert "profileArn" not in sent_body
+        assert sent_body.get("profileArn") == mock_auth_manager.profile_arn
 
     @pytest.mark.asyncio
     async def test_mcp_request_includes_profile_arn_for_enterprise_ide(self, mock_auth_manager):

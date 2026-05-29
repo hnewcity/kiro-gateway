@@ -2197,8 +2197,12 @@ class TestMessagesProfileArnSelection:
     @pytest.mark.parametrize("stream", [False, True])
     async def test_messages_omits_aws_sso_profile_arn_for_streaming_modes(self, stream):
         """
-        What it does: Verifies plain AWS SSO profileArn is not passed to converter.
-        Purpose: Preserve known-good kiro-cli AWS SSO behavior across Anthropic modes.
+        What it does: Verifies AWS SSO profileArn is passed to converter.
+        Purpose: After the runtime.kiro.dev migration, profileArn is required
+            for all auth types — including plain kiro-cli AWS SSO OIDC. The
+            legacy q.amazonaws.com endpoint used to reject profileArn for SSO,
+            but runtime requires it (test name kept for history; see
+            kiro/profile_arn.py).
         """
         print(f"Setup: Creating AWS SSO request with stream={stream}...")
         from kiro.auth import AuthType, KiroAuthManager
@@ -2221,9 +2225,9 @@ class TestMessagesProfileArnSelection:
         with patch("kiro.routes_anthropic.anthropic_to_kiro", side_effect=ValueError("stop")) as mock_converter:
             response = await messages(request, request_data)
 
-        print("Checking: Converter received empty profile ARN...")
+        print("Checking: Converter received AWS SSO profile ARN...")
         assert response.status_code == 400
-        assert mock_converter.call_args.args[2] == ""
+        assert mock_converter.call_args.args[2] == auth_manager.profile_arn
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stream", [False, True])
