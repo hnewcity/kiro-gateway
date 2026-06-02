@@ -188,6 +188,11 @@ KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # runtime.kiro.dev only serves GenerateAssistantResponse; profile listing lives on q.amazonaws.com
 KIRO_LIST_PROFILES_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
+# Host for management/control-plane operations (ListAvailableModels, GetUsageLimits).
+# runtime.kiro.dev only serves GenerateAssistantResponse — these operations return
+# UnknownOperationException there and must go to the Q control plane on q.amazonaws.com.
+KIRO_MANAGEMENT_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -587,4 +592,9 @@ def get_kiro_q_host(region: str) -> str:
 def get_kiro_list_profiles_host(region: str) -> str:
     """Return host for ListAvailableProfiles (Enterprise IdC profile discovery)."""
     return KIRO_LIST_PROFILES_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_management_host(region: str) -> str:
+    """Return host for management operations (ListAvailableModels, GetUsageLimits)."""
+    return KIRO_MANAGEMENT_HOST_TEMPLATE.format(region=region)
 

@@ -139,8 +139,13 @@ async def get_usage(request: Request):
     headers["x-amz-target"] = "com.amazon.aws.codewhisperer.runtime.AmazonCodeWhispererService.GetUsageLimits"
     headers["Content-Type"] = "application/x-amz-json-1.0"
 
-    url = auth_manager.api_host
+    # GetUsageLimits is a control-plane operation — it lives on the Q management
+    # host (q.{region}.amazonaws.com), not runtime.kiro.dev (which only serves
+    # GenerateAssistantResponse and returns UnknownOperationException here).
+    url = auth_manager.management_host
     body = {"origin": "AI_EDITOR"}
+    if auth_manager.profile_arn:
+        body["profileArn"] = auth_manager.profile_arn
 
     try:
         response = await shared_client.post(url, json=body, headers=headers)
