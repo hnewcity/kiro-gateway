@@ -159,7 +159,7 @@ async def call_kiro_mcp_api(
             "Content-Type": "application/json"
         }
         
-        mcp_url = f"{auth_manager.q_host}/mcp"
+        mcp_url = f"{auth_manager.management_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
         async with httpx.AsyncClient(timeout=60.0) as client:

@@ -162,7 +162,70 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+# ==================================================================================================
+# Server-Side Tool Content Block Models
+# ==================================================================================================
+
+
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use block (Anthropic server tools).
+
+    Emitted by Anthropic server-side tools such as web_search, web_fetch and
+    code_execution, then replayed back into the conversation history by clients
+    like Claude Code. Accepted for validation only; the converters extract just
+    text/tool_use/tool_result blocks, so the raw server-tool call is ignored.
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Web search tool result block (Anthropic server tool).
+
+    Paired with a ServerToolUseContentBlock, this carries the search results
+    returned by Anthropic's server-side web_search tool. The ``content`` field
+    is a list of provider-specific result objects (or an error object), so it is
+    kept loosely typed. Accepted for validation; not forwarded to Kiro.
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[List[Dict[str, Any]], Dict[str, Any], str, None] = None
+
+    model_config = {"extra": "allow"}
+
+
+class UnknownContentBlock(BaseModel):
+    """
+    Forward-compatible fallback for unrecognized content blocks.
+
+    Anthropic periodically ships new server-side tool block types (e.g.
+    code_execution_tool_result, mcp_tool_use). Rather than 422 on every new
+    block, we accept any block that carries a ``type`` string and preserve its
+    extra fields. The converters ignore blocks they do not explicitly handle,
+    so unknown blocks are dropped safely instead of breaking the request.
+
+    MUST be the last member of the ContentBlock union: as a catch-all with only
+    a ``type: str`` field it would otherwise shadow the specific typed blocks
+    under Pydantic union resolution.
+    """
+
+    type: str
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images and thinking).
+# Server-side tool blocks (server_tool_use, web_search_tool_result) are accepted
+# so clients replaying Anthropic server-tool output into history don't 422; the
+# catch-all UnknownContentBlock MUST stay last so it does not shadow typed blocks.
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +233,9 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
+    UnknownContentBlock,
 ]
 
 
