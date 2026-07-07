@@ -519,12 +519,12 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 # WebSearch Settings (MCP Tool Emulation)
 # ==================================================================================================
 
-# Enable web_search tool auto-injection (default: true)
+# Enable web_search tool auto-injection (default: false)
 # When enabled, web_search is automatically added as a tool for MCP emulation (Path B)
 # Model decides whether to use it or not
 #
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
-WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
 # Account System Settings
