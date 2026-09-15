@@ -373,21 +373,26 @@ STRIP_BILLING_HEADER: bool = os.getenv("STRIP_BILLING_HEADER", "true").lower() i
 # Timeout for waiting for the first token from the model (in seconds).
 # If the model doesn't respond within this time, the request will be cancelled and retried.
 # This helps handle "stuck" requests when the model takes too long to think.
-# Default: 30 seconds (recommended for production)
-# Set a lower value (e.g., 10-15) for more aggressive retry.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
+# Default: 60 seconds. Reasoning-capable models can take well over 15s to emit
+# their first token on long prompts, and a premature cancel here re-sends the whole
+# prompt upstream, adding load instead of recovering from it.
+# Set a lower value (e.g., 20-30) for more aggressive retry.
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "60"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
 # Should be longer than FIRST_TOKEN_TIMEOUT since the model may pause between chunks
 # while "thinking" (especially for tool calls or complex reasoning).
-# Default: 300 seconds (5 minutes) - generous timeout to avoid premature disconnects.
-STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300"))
+# Default: 120 seconds. An upstream that has gone silent for two minutes mid-stream
+# is not coming back, and waiting 5 minutes only turns a fast failure into a hang the
+# client cannot retry around. Raise this if long tool-call pauses get cut short.
+STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "120"))
 
 # Maximum number of attempts on first token timeout.
 # After exhausting all attempts, an error will be returned.
-# Default: 3 attempts
-FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
+# Each attempt re-sends the full prompt, so keep this low.
+# Default: 2 attempts
+FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "2"))
 
 # ==================================================================================================
 # Debug Settings
