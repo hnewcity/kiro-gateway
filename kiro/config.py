@@ -504,6 +504,15 @@ _FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
 # Default is True - if env var is not set or empty, enable fake reasoning
 FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
 
+# When to inject fake reasoning tags (only for models without native reasoning;
+# Claude >= 4.6 and GPT models never get tags, they use output_config/reasoning effort):
+# - "explicit" (default): only when the client explicitly asks for thinking
+#   (Anthropic thinking.type="enabled", OpenAI reasoning_effort low/medium/high).
+#   No thinking param / "adaptive" -> no injection. Fastest time-to-first-token.
+# - "always": legacy behaviour, inject unless the client disables thinking.
+_FAKE_REASONING_MODE_RAW: str = os.getenv("FAKE_REASONING_MODE", "explicit").lower()
+FAKE_REASONING_MODE: str = _FAKE_REASONING_MODE_RAW if _FAKE_REASONING_MODE_RAW in ("explicit", "always") else "explicit"
+
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
 # Higher values allow for more detailed reasoning but increase response time and token usage.

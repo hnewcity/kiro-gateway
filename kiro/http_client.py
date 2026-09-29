@@ -400,11 +400,14 @@ class KiroHttpClient:
                     body = await response.aread()
                     if ADDITIONAL_FIELDS_KEY.encode() in body:
                         model_id = _payload_model_id(json_data)
-                        if model_id:
+                        # Remember the model only when the field itself is unsupported;
+                        # a rejected value (e.g. an unknown effort) affects this request only,
+                        # so later requests still honour the client's effort.
+                        if model_id and b"not supported" in body.lower():
                             _ADDITIONAL_FIELDS_REJECTED.add(model_id)
                         logger.warning(
-                            f"Kiro rejected {ADDITIONAL_FIELDS_KEY} for model '{model_id}', "
-                            f"retrying without it"
+                            f"Kiro rejected {ADDITIONAL_FIELDS_KEY} for model '{model_id}': "
+                            f"{body[:200].decode('utf-8', errors='replace')} - retrying without it"
                         )
                         await response.aclose()
                         json_data = {k: v for k, v in json_data.items() if k != ADDITIONAL_FIELDS_KEY}

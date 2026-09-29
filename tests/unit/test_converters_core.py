@@ -3548,40 +3548,17 @@ class TestInjectThinkingTags:
         print("Checking that original content is preserved at the end...")
         assert result.endswith("What is 2+2?")
     
-    def test_injects_thinking_instruction_tag(self):
+    def test_does_not_inject_slow_thinking_instruction(self):
         """
-        What it does: Verifies that thinking_instruction tag is injected.
-        Purpose: Ensure the quality improvement prompt is included.
+        What it does: Verifies only the two control tags are injected.
+        Purpose: The old "take the time you need" instruction slowed responses; it must be gone.
         """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Analyze this code"
-        
-        print("Action: Inject thinking tags...")
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 8000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print(f"Result length: {len(result)} chars")
-        print("Checking that thinking_instruction tag is present...")
-        assert "<thinking_instruction>" in result
-        assert "</thinking_instruction>" in result
-    
-    def test_thinking_instruction_contains_english_directive(self):
-        """
-        What it does: Verifies that thinking instruction includes English language directive.
-        Purpose: Ensure model is instructed to think in English for better reasoning quality.
-        """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Test"
-        
-        print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print("Checking for English directive...")
-        assert "Think in English" in result
-    
+            result = inject_thinking_tags("Analyze this code", ThinkingConfig(enabled=True, budget_tokens=8000), "claude-sonnet-4.5")
+        assert result == "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>8000</max_thinking_length>\n\nAnalyze this code"
+        assert "<thinking_instruction>" not in result
+        assert "Quality of thought" not in result
+
     def test_uses_configured_max_tokens(self):
         """
         What it does: Verifies that FAKE_REASONING_MAX_TOKENS config value is used.
@@ -3616,7 +3593,7 @@ class TestInjectThinkingTags:
         print(f"Result length: {len(result)} chars")
         print("Checking that tags are present even with empty content...")
         assert "<thinking_mode>enabled</thinking_mode>" in result
-        assert "<thinking_instruction>" in result
+        assert "<thinking_instruction>" not in result
     
     def test_preserves_multiline_content(self):
         """
@@ -3651,70 +3628,6 @@ class TestInjectThinkingTags:
         assert "<code>example</code>" in result
         assert "{json: 'value'}" in result
     
-    def test_thinking_instruction_contains_systematic_approach(self):
-        """
-        What it does: Verifies that thinking instruction includes systematic approach guidance.
-        Purpose: Ensure model is instructed to think systematically.
-        """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Test"
-        
-        print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print("Checking for systematic approach keywords...")
-        assert "thorough" in result.lower() or "systematic" in result.lower()
-    
-    def test_thinking_instruction_contains_understanding_step(self):
-        """
-        What it does: Verifies that thinking instruction includes understanding step.
-        Purpose: Ensure model is instructed to understand the problem first.
-        """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Test"
-        
-        print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print("Checking for understanding step...")
-        assert "understand" in result.lower()
-    
-    def test_thinking_instruction_contains_verification_step(self):
-        """
-        What it does: Verifies that thinking instruction includes verification step.
-        Purpose: Ensure model is instructed to verify reasoning before concluding.
-        """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Test"
-        
-        print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print("Checking for verification step...")
-        assert "verify" in result.lower()
-    
-    def test_thinking_instruction_contains_quality_emphasis(self):
-        """
-        What it does: Verifies that thinking instruction emphasizes quality over speed.
-        Purpose: Ensure model is instructed to prioritize quality of thought.
-        """
-        print("Setup: Content with fake reasoning enabled...")
-        content = "Test"
-        
-        print("Action: Inject thinking tags...")
-        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = inject_thinking_tags(content, ThinkingConfig())
-        
-        print("Checking for quality emphasis...")
-        assert "quality" in result.lower()
-    
     def test_tag_order_is_correct(self):
         """
         What it does: Verifies that tags are in the correct order.
@@ -3731,14 +3644,10 @@ class TestInjectThinkingTags:
         print("Checking tag order...")
         thinking_mode_pos = result.find("<thinking_mode>")
         max_length_pos = result.find("<max_thinking_length>")
-        instruction_pos = result.find("<thinking_instruction>")
         content_pos = result.find("USER_CONTENT_HERE")
         
-        print(f"Positions: thinking_mode={thinking_mode_pos}, max_length={max_length_pos}, instruction={instruction_pos}, content={content_pos}")
-        
-        assert thinking_mode_pos < max_length_pos, "thinking_mode should come before max_thinking_length"
-        assert max_length_pos < instruction_pos, "max_thinking_length should come before thinking_instruction"
-        assert instruction_pos < content_pos, "thinking_instruction should come before user content"
+        assert thinking_mode_pos == 0, "thinking_mode should come first"
+        assert thinking_mode_pos < max_length_pos < content_pos, "tags must precede user content"
 
 
 # ==================================================================================================
@@ -6790,7 +6699,7 @@ class TestSystemPromptPair:
             payload = build_kiro_payload(
                 messages=[UnifiedMessage(role="user", content="Hi")],
                 system_prompt="Sys",
-                model_id="claude-sonnet-4.6",
+                model_id="claude-sonnet-4.5",
                 tools=None,
                 conversation_id="c",
                 profile_arn="",

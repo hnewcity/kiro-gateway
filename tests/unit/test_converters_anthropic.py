@@ -1676,6 +1676,7 @@ class TestAnthropicToKiro:
             model="claude-sonnet-4-5",
             messages=[AnthropicMessage(role="user", content="What is 2+2?")],
             max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 4000},
         )
 
         print("Action: Converting to Kiro payload with fake reasoning...")
@@ -1718,6 +1719,7 @@ class TestAnthropicToKiro:
                 )
             ],
             max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 4000},
             # Tools must be defined for tool_results to be preserved
             tools=[
                 AnthropicTool(
@@ -1777,7 +1779,8 @@ class TestExtractThinkingConfigFromAnthropic:
         config = extract_thinking_config_from_anthropic(request)
         
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
-        assert config.enabled is True
+        # explicit mode (default): no fake tags unless thinking.type == "enabled"
+        assert config.enabled is False
         assert config.budget_tokens is None
     
     def test_thinking_enabled_with_budget(self):
@@ -1857,7 +1860,8 @@ class TestExtractThinkingConfigFromAnthropic:
         config = extract_thinking_config_from_anthropic(request)
         
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
-        assert config.enabled is True
+        # explicit mode (default): no fake tags unless thinking.type == "enabled"
+        assert config.enabled is False
         assert config.budget_tokens is None
     
 

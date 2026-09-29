@@ -693,6 +693,9 @@ class AwsEventStreamParser:
             logger.warning(f"Failed to decode '{event_type}' payload: {e}. Raw: {payload[:100]!r}")
             return None
         
+        if event_type == "metadataEvent":
+            return self._process_metadata_event(data)
+        
         if event_type == "toolUseEvent":
             if not isinstance(data, dict):
                 logger.warning(f"Unexpected toolUseEvent payload type: {type(data).__name__}")
@@ -767,6 +770,37 @@ class AwsEventStreamParser:
         if data.get("stop"):
             self._process_tool_stop_event(data)
         return None
+    
+    def _process_metadata_event(self, data: Any) -> Optional[Dict[str, Any]]:
+        """
+        Handles metadataEvent frames.
+        
+        A refusal arrives as {"stopReason": "CONTENT_FILTERED", "stopDetails":
+        {"refusal": {"category", "explanation"}}} with no content at all. It is
+        surfaced as an exception event so it is never returned as an empty end_turn.
+        
+        Args:
+            data: Decoded metadataEvent payload
+        
+        Returns:
+            Exception event for refusals, otherwise None
+        """
+        if not isinstance(data, dict):
+            return None
+        stop_reason = data.get("stopReason")
+        details = data.get("stopDetails") if isinstance(data.get("stopDetails"), dict) else {}
+        refusal = details.get("refusal") if isinstance(details.get("refusal"), dict) else None
+        if stop_reason != "CONTENT_FILTERED" and refusal is None:
+            logger.debug(f"metadataEvent: {str(data)[:200]}")
+            return None
+        category = (refusal or {}).get("category") or stop_reason or "CONTENT_FILTERED"
+        explanation = (refusal or {}).get("explanation") or "The model refused to continue."
+        message = f"{explanation} (reason: {category})"
+        logger.warning(f"Kiro refused the request: {message}")
+        return {
+            "type": "exception",
+            "data": {"exception_type": "ContentFilteredException", "message": message, "raw": data},
+        }
     
     def _build_exception_event(self, exception_type: str, payload: bytes) -> Dict[str, Any]:
         """

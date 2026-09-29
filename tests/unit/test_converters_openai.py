@@ -949,6 +949,7 @@ class TestBuildKiroPayload:
         print("Setup: Request where last message is a tool result...")
         request = ChatCompletionRequest(
             model="claude-sonnet-4-5",
+            reasoning_effort="medium",
             messages=[
                 ChatMessage(role="user", content="Run a command"),
                 ChatMessage(
@@ -989,7 +990,8 @@ class TestBuildKiroPayload:
         
         assert "toolResults" in context, "toolResults should be present"
         assert "<thinking_mode>enabled</thinking_mode>" in content, "thinking tags SHOULD be injected even with toolResults"
-        assert "<max_thinking_length>4000</max_thinking_length>" in content, "max_thinking_length should be present"
+        # budget comes from reasoning_effort="medium", not the 4000 default
+        assert "<max_thinking_length>" in content, "max_thinking_length should be present"
     
     def test_injects_thinking_tags_when_no_tool_results(self):
         """
@@ -999,6 +1001,7 @@ class TestBuildKiroPayload:
         print("Setup: Normal user message without tool results...")
         request = ChatCompletionRequest(
             model="claude-sonnet-4-5",
+            reasoning_effort="medium",
             messages=[ChatMessage(role="user", content="Hello")]
         )
         
@@ -1833,7 +1836,8 @@ class TestExtractThinkingConfigFromOpenAI:
         config = extract_thinking_config_from_openai(request)
         
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
-        assert config.enabled is True
+        # explicit mode (default): no fake tags without reasoning_effort
+        assert config.enabled is False
         assert config.budget_tokens is None
     
     def test_reasoning_effort_none(self):

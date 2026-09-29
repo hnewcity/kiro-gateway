@@ -361,9 +361,11 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         >>> extract_thinking_config_from_openai(request)
         ThinkingConfig(enabled=True, budget_tokens=3276)  # 80% of 4096
     """
+    from kiro.config import FAKE_REASONING_MODE
+
     if not request.reasoning_effort:
-        # No reasoning_effort specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
+        # No reasoning_effort specified → inject only in legacy "always" mode
+        return ThinkingConfig(enabled=FAKE_REASONING_MODE == "always", budget_tokens=None)
     
     if request.reasoning_effort == "none":
         # Explicitly disabled

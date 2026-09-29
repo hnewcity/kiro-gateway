@@ -454,13 +454,18 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
     """
+    from kiro.config import FAKE_REASONING_MODE
+
+    # "explicit" mode: inject only when the client explicitly enables thinking
+    implicit_default = FAKE_REASONING_MODE == "always"
+
     if not request.thinking:
         # No thinking specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
+        return ThinkingConfig(enabled=implicit_default, budget_tokens=None)
     
     if not isinstance(request.thinking, dict):
         # Invalid format → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
+        return ThinkingConfig(enabled=implicit_default, budget_tokens=None)
     
     thinking_type = request.thinking.get("type")
     
@@ -475,8 +480,8 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
         return ThinkingConfig(enabled=True, budget_tokens=budget)
     
-    # Unknown type → use defaults
-    return ThinkingConfig(enabled=True, budget_tokens=None)
+    # "adaptive" / unknown type → model decides; no fake tags in explicit mode
+    return ThinkingConfig(enabled=implicit_default, budget_tokens=None)
 
 
 def anthropic_to_kiro(

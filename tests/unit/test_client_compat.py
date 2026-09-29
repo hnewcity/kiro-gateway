@@ -245,3 +245,136 @@ class TestAdditionalFieldsGating:
         from kiro.converters_core import additional_fields_skipped
 
         assert additional_fields_skipped(model) is skipped
+
+
+# ==================================================================================================
+# Thinking injection policy / refusals / effort fallback
+# ==================================================================================================
+
+from kiro.converters_core import (
+    ThinkingConfig,
+    inject_thinking_tags,
+    model_has_native_reasoning,
+    should_inject_thinking,
+)
+from kiro.parsers import AwsEventStreamParser, encode_eventstream_frame
+
+
+class TestThinkingPolicy:
+    @pytest.mark.parametrize("model,native", [
+        ("claude-opus-5.5", True), ("claude-sonnet-4.6", True), ("claude-opus-4.7", True),
+        ("gpt-5.6-sol", True), ("claude-sonnet-4.5", False), ("claude-haiku-4.5", False),
+        ("claude-sonnet-4", False), ("deepseek-3.2", False),
+    ])
+    def test_native_reasoning(self, model, native):
+        assert model_has_native_reasoning(model) is native
+
+    def test_never_inject_into_native_models(self):
+        cfg = ThinkingConfig(enabled=True, budget_tokens=8000)
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            assert inject_thinking_tags("Hi", cfg, "claude-opus-5.5") == "Hi"
+            assert not should_inject_thinking(cfg, "claude-opus-5.5")
+            assert should_inject_thinking(cfg, "claude-sonnet-4.5")
+
+    def test_native_model_payload_has_no_thinking_text(self):
+        from kiro.converters_core import build_kiro_payload, UnifiedMessage
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = build_kiro_payload(
+                messages=[UnifiedMessage(role="user", content="Hi")], system_prompt="Sys",
+                model_id="claude-opus-5.5", tools=None, conversation_id="c", profile_arn="",
+                thinking_config=ThinkingConfig(enabled=True, budget_tokens=8000),
+                output_config={"effort": "high"},
+            ).payload
+        dumped = json.dumps(payload)
+        assert "thinking_mode" not in dumped
+        assert "Extended Thinking Mode" not in dumped
+        assert payload["additionalModelRequestFields"]["output_config"]["effort"] == "high"
+
+    @pytest.mark.parametrize("thinking,expected", [
+        (None, False), ({"type": "adaptive"}, False), ({"type": "disabled"}, False),
+        ({"type": "enabled", "budget_tokens": 2000}, True),
+    ])
+    def test_anthropic_explicit_mode(self, thinking, expected):
+        from kiro.converters_anthropic import extract_thinking_config_from_anthropic
+        from kiro.models_anthropic import AnthropicMessagesRequest
+
+        body = {"model": "claude-sonnet-4.5", "max_tokens": 64, "messages": [{"role": "user", "content": "x"}]}
+        if thinking:
+            body["thinking"] = thinking
+        assert extract_thinking_config_from_anthropic(AnthropicMessagesRequest(**body)).enabled is expected
+
+    def test_always_mode_restores_legacy(self, monkeypatch):
+        from kiro.converters_anthropic import extract_thinking_config_from_anthropic
+        from kiro.models_anthropic import AnthropicMessagesRequest
+
+        monkeypatch.setattr("kiro.config.FAKE_REASONING_MODE", "always")
+        req = AnthropicMessagesRequest(model="claude-sonnet-4.5", max_tokens=64, messages=[{"role": "user", "content": "x"}])
+        assert extract_thinking_config_from_anthropic(req).enabled is True
+
+
+class TestRefusal:
+    def _frame(self, payload):
+        return encode_eventstream_frame(
+            {":message-type": "event", ":event-type": "metadataEvent", ":content-type": "application/json"},
+            json.dumps(payload).encode(),
+        )
+
+    def test_refusal_becomes_exception(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(self._frame({
+            "stopReason": "CONTENT_FILTERED",
+            "stopDetails": {"refusal": {"category": "REASONING_EXTRACTION", "explanation": "cannot continue"}},
+        }))
+        assert len(events) == 1 and events[0]["type"] == "exception"
+        assert events[0]["data"]["exception_type"] == "ContentFilteredException"
+        assert "REASONING_EXTRACTION" in events[0]["data"]["message"]
+
+    def test_normal_metadata_ignored(self):
+        assert AwsEventStreamParser().feed(self._frame({"stopReason": "END_TURN"})) == []
+
+    def test_refusal_is_non_retryable_error_event(self):
+        event = stream_error_event(KiroStreamError("ContentFilteredException", "cannot continue (reason: X)"))
+        assert '"invalid_request_error"' in event
+        assert "cannot continue" in event
+
+
+class TestEffortFallbackScope:
+    @pytest.mark.asyncio
+    async def test_rejected_value_is_not_remembered(self):
+        from unittest.mock import Mock
+        from kiro import http_client as hc
+        from kiro.http_client import KiroHttpClient
+
+        hc._ADDITIONAL_FIELDS_REJECTED.clear()
+        auth = Mock(); auth.fingerprint = "fp"; auth.get_access_token = AsyncMock(return_value="t")
+        client = KiroHttpClient(auth)
+        r400 = Mock(status_code=400)
+        r400.aread = AsyncMock(return_value=b'{"message":"Invalid value for additionalModelRequestFields.output_config.effort"}')
+        r400.aclose = AsyncMock()
+        mock_client = AsyncMock(); mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=[r400, Mock(status_code=200)])
+        payload = {
+            "conversationState": {"currentMessage": {"userInputMessage": {"modelId": "claude-opus-5.5"}}},
+            "additionalModelRequestFields": {"output_config": {"effort": "max"}},
+        }
+        with patch.object(client, "_get_client", return_value=mock_client):
+            resp = await client.request_with_retry("POST", "https://api.example.com/x", payload)
+        assert resp.status_code == 200
+        assert "claude-opus-5.5" not in hc._ADDITIONAL_FIELDS_REJECTED
+
+
+class TestNonStreamErrorResponse:
+    def test_refusal_is_400(self):
+        from kiro.routes_anthropic import _stream_error_response
+
+        r = _stream_error_response(KiroStreamError("ContentFilteredException", "cannot continue"))
+        assert r.status_code == 400
+        assert json.loads(r.body)["error"]["type"] == "invalid_request_error"
+
+    def test_other_exception_is_overloaded(self):
+        from kiro.routes_anthropic import _stream_error_response
+
+        r = _stream_error_response(KiroStreamError("InternalServerException", "boom"))
+        assert r.status_code == 529
+        assert json.loads(r.body)["error"]["type"] == "overloaded_error"

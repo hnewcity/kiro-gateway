@@ -53,6 +53,7 @@ from kiro.streaming_anthropic import (
     with_sse_pings,
 )
 from kiro.http_client import KiroHttpClient
+from kiro.streaming_core import KiroStreamError
 from kiro.profile_arn import profile_arn_for_payload
 from kiro.utils import derive_conversation_id, generate_conversation_id
 from kiro.tokenizer import count_message_tokens, count_tools_tokens
@@ -135,6 +136,30 @@ def _stable_conversation_id(request_data: Any) -> str:
     first_message = request_data.messages[0].content if request_data.messages else None
     return derive_conversation_id(
         request_data.metadata, request_data.system, tool_names, first_message
+    )
+
+
+def _stream_error_response(error: "KiroStreamError") -> JSONResponse:
+    """
+    Maps an upstream exception raised while collecting a non-streaming response.
+
+    Refusals (ContentFilteredException) are not retryable -> 400 invalid_request_error.
+    Other upstream exceptions are transient -> 529 overloaded_error.
+
+    Args:
+        error: Exception raised by collect_anthropic_response
+
+    Returns:
+        JSONResponse in Anthropic error format
+    """
+    if error.exception_type == "ContentFilteredException":
+        status, error_type = 400, "invalid_request_error"
+    else:
+        status, error_type = 529, "overloaded_error"
+    logger.warning(f"HTTP {status} - POST /v1/messages - {error.exception_type}: {error.exception_message[:100]}")
+    return JSONResponse(
+        status_code=status,
+        content={"type": "error", "error": {"type": error_type, "message": error.exception_message or error.exception_type}},
     )
 
 
@@ -661,6 +686,9 @@ async def messages(
                 if debug_logger:
                     debug_logger.flush_on_error(e.status_code, str(e.detail))
                 raise
+            except KiroStreamError as e:
+                await http_client.close()
+                return _stream_error_response(e)
             except Exception as e:
                 await http_client.close()
                 logger.error(f"Internal error: {e}", exc_info=True)
@@ -921,6 +949,9 @@ async def messages(
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
+    except KiroStreamError as e:
+        await http_client.close()
+        return _stream_error_response(e)
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)

@@ -1044,6 +1044,12 @@ def stream_error_event(error: Exception) -> str:
     Returns:
         SSE-formatted error event
     """
+    if isinstance(error, KiroStreamError) and error.exception_type == "ContentFilteredException":
+        # Refusal: retrying the same request will not help
+        return format_sse_event("error", {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": error.exception_message},
+        })
     body: Optional[Dict[str, Any]] = None
     try:
         parsed = json.loads(str(error))
