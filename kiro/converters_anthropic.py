@@ -536,6 +536,9 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        max_tokens=request.max_tokens,
+        # output_config is not a declared field; it arrives via model_config extra="allow"
+        output_config=getattr(request, "output_config", None),
     )
 
     return result.payload

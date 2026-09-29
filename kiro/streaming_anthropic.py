@@ -31,6 +31,7 @@ This module formats Kiro events into Anthropic SSE format:
 Reference: https://docs.anthropic.com/en/api/messages-streaming
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -46,6 +47,8 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    KiroStreamError,
+    is_content_length_exception,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
@@ -181,6 +184,8 @@ async def stream_kiro_to_anthropic(
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
+    # Upstream reported ContentLengthExceeded mid-stream (output hit its limit)
+    upstream_length_exceeded = False
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
@@ -506,9 +511,22 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+            elif event.type == "exception":
+                if is_content_length_exception(event.exception_type):
+                    logger.warning(
+                        f"Upstream stopped generation: {event.exception_type} "
+                        f"({event.exception_message}) -> stop_reason=max_tokens"
+                    )
+                    upstream_length_exceeded = True
+                else:
+                    # Never disguise an upstream failure as a normal end_turn
+                    raise KiroStreamError(
+                        event.exception_type or "UnknownException",
+                        event.exception_message or "",
+                    )
         
         # Track completion signals for truncation detection
-        stream_completed_normally = context_usage_percentage is not None
+        stream_completed_normally = context_usage_percentage is not None or upstream_length_exceeded
         
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
@@ -626,7 +644,7 @@ async def stream_kiro_to_anthropic(
             input_tokens = prompt_tokens
         
         # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
+        if content_was_truncated or upstream_length_exceeded:
             stop_reason = "max_tokens"
         elif tool_blocks:
             stop_reason = "tool_use"
@@ -691,6 +709,11 @@ async def stream_kiro_to_anthropic(
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
+        if isinstance(e, KiroStreamError):
+            # Upstream exception frame. The route wrapper turns it into a single
+            # overloaded_error SSE event (retryable) via stream_error_event().
+            logger.error(f"Upstream stream exception: {error_msg}")
+            raise
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
         
         # Send error event
@@ -741,6 +764,10 @@ async def collect_anthropic_response(
     # Collect stream result
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
+    upstream_length_exceeded = is_content_length_exception(result.exception_type)
+    if result.exception_type and not upstream_length_exceeded:
+        # Never return a partial response as if it completed normally
+        raise KiroStreamError(result.exception_type, result.exception_message or "")
     
     # Build content blocks
     content_blocks = []
@@ -808,7 +835,7 @@ async def collect_anthropic_response(
         input_tokens = prompt_tokens
     
     # Detect content truncation (missing completion signals)
-    stream_completed_normally = result.context_usage_percentage is not None
+    stream_completed_normally = result.context_usage_percentage is not None or upstream_length_exceeded
     content_was_truncated = (
         not stream_completed_normally and
         len(result.content) > 0 and
@@ -824,7 +851,7 @@ async def collect_anthropic_response(
         )
     
     # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
+    if content_was_truncated or upstream_length_exceeded:
         stop_reason = "max_tokens"
     elif result.tool_calls:
         stop_reason = "tool_use"
@@ -895,10 +922,16 @@ async def stream_with_first_token_retry_anthropic(
     """
     def create_http_error(status_code: int, error_text: str) -> Exception:
         """Create exception for HTTP errors in Anthropic format."""
+        if status_code == 429:
+            error_type = "rate_limit_error"
+        elif status_code == 408 or status_code >= 500:
+            error_type = "overloaded_error"
+        else:
+            error_type = "api_error"
         return Exception(json.dumps({
             "type": "error",
             "error": {
-                "type": "api_error",
+                "type": error_type,
                 "message": f"Upstream API error: {error_text}"
             }
         }))
@@ -935,3 +968,95 @@ async def stream_with_first_token_retry_anthropic(
         on_all_retries_failed=create_timeout_error,
     ):
         yield chunk
+
+
+PING_SSE_EVENT = 'event: ping\ndata: {"type": "ping"}\n\n'
+
+
+async def with_sse_pings(
+    source: AsyncGenerator[str, None],
+    interval: float,
+) -> AsyncGenerator[str, None]:
+    """
+    Interleaves Anthropic `ping` events into an SSE stream while upstream is silent.
+
+    Long first-token waits or long thinking can leave the connection idle long
+    enough for reverse proxies / clients to drop it. A ping is emitted whenever
+    no chunk arrived for `interval` seconds; busy streams are never delayed.
+
+    Args:
+        source: Anthropic SSE chunk generator
+        interval: Idle seconds before a ping (<= 0 disables pings)
+
+    Yields:
+        Chunks from source, plus ping events
+    """
+    if interval <= 0:
+        async for chunk in source:
+            yield chunk
+        return
+
+    iterator = source.__aiter__()
+    pending: Optional[asyncio.Task] = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield PING_SSE_EVENT
+                continue
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            yield chunk
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+            except Exception as e:  # source already failing; we're cleaning up
+                logger.debug(f"Source stream error during ping cleanup: {e}")
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except RuntimeError as e:
+                logger.debug(f"Could not close source stream: {e}")
+
+
+def stream_error_event(error: Exception) -> str:
+    """
+    Builds an Anthropic SSE `error` event from a streaming exception.
+
+    Exceptions raised by the retry wrapper carry a JSON Anthropic error body;
+    that body is forwarded as-is so its type (rate_limit_error / overloaded_error)
+    reaches the client. Anything else is reported as overloaded_error, which
+    clients treat as retryable, instead of a generic api_error.
+
+    Args:
+        error: Exception raised while streaming
+
+    Returns:
+        SSE-formatted error event
+    """
+    body: Optional[Dict[str, Any]] = None
+    try:
+        parsed = json.loads(str(error))
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            body = parsed
+    except (json.JSONDecodeError, TypeError):
+        body = None
+    if body is None:
+        body = {
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": str(error) or "Upstream stream was interrupted. Please retry.",
+            },
+        }
+    return format_sse_event("error", body)

@@ -1832,3 +1832,180 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+# ==================================================================================================
+# Exception events and full metering dict (binary eventstream contract)
+# ==================================================================================================
+
+import json as _json
+
+from kiro.parsers import encode_eventstream_frame
+from kiro.streaming_core import KiroStreamError, is_content_length_exception
+
+
+def _event_frame(event_type: str, payload) -> bytes:
+    """Builds a binary eventstream event frame."""
+    body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return encode_eventstream_frame({":message-type": "event", ":event-type": event_type}, body)
+
+
+def _exception_frame(exception_type: str, message: str) -> bytes:
+    """Builds a binary eventstream exception frame."""
+    body = _json.dumps({"message": message}).encode("utf-8")
+    return encode_eventstream_frame({":message-type": "exception", ":exception-type": exception_type}, body)
+
+
+def _response_with_chunks(chunks):
+    """Builds a mock response yielding the given byte chunks."""
+    response = AsyncMock()
+    response.status_code = 200
+
+    async def mock_aiter_bytes():
+        for chunk in chunks:
+            yield chunk
+
+    response.aiter_bytes = mock_aiter_bytes
+    return response
+
+
+class TestKiroEventExceptionFields:
+    """Tests for the exception fields on KiroEvent / StreamResult."""
+
+    def test_kiro_event_exception_defaults(self):
+        """
+        What it does: Creates a plain KiroEvent.
+        Goal: Ensure exception fields default to None.
+        """
+        event = KiroEvent(type="content", content="x")
+        assert event.exception_type is None
+        assert event.exception_message is None
+
+    def test_stream_result_exception_defaults(self):
+        """
+        What it does: Creates an empty StreamResult.
+        Goal: Ensure exception fields default to None.
+        """
+        result = StreamResult()
+        assert result.exception_type is None
+        assert result.exception_message is None
+
+    def test_is_content_length_exception(self):
+        """
+        What it does: Checks exception type classification.
+        Goal: Ensure only ContentLengthExceeded* counts as a length stop.
+        """
+        assert is_content_length_exception("ContentLengthExceededException")
+        assert not is_content_length_exception("ThrottlingException")
+        assert not is_content_length_exception(None)
+        assert not is_content_length_exception("")
+
+    def test_kiro_stream_error_carries_details(self):
+        """
+        What it does: Creates a KiroStreamError.
+        Goal: Ensure type and message are preserved.
+        """
+        error = KiroStreamError("ThrottlingException", "slow down")
+        assert error.exception_type == "ThrottlingException"
+        assert error.exception_message == "slow down"
+        assert "ThrottlingException" in str(error)
+
+
+class TestProcessChunkExceptionEvents:
+    """Tests for exception events in _process_chunk()."""
+
+    @pytest.mark.asyncio
+    async def test_converts_exception_event(self, mock_parser):
+        """
+        What it does: Processes a parser exception event.
+        Goal: Ensure it becomes KiroEvent(type="exception") with type and message.
+        """
+        mock_parser.feed.return_value = [{
+            "type": "exception",
+            "data": {"exception_type": "ThrottlingException", "message": "slow down", "raw": {"message": "slow down"}},
+        }]
+        events = [e async for e in _process_chunk(mock_parser, b"chunk", None)]
+        assert len(events) == 1
+        assert events[0].type == "exception"
+        assert events[0].exception_type == "ThrottlingException"
+        assert events[0].exception_message == "slow down"
+
+    @pytest.mark.asyncio
+    async def test_exception_event_missing_fields(self, mock_parser):
+        """
+        What it does: Processes an exception event with empty data.
+        Goal: Ensure safe defaults are used.
+        """
+        mock_parser.feed.return_value = [{"type": "exception", "data": {}}]
+        events = [e async for e in _process_chunk(mock_parser, b"chunk", None)]
+        assert events[0].exception_type == "UnknownException"
+        assert events[0].exception_message == ""
+
+
+class TestBinaryStreamEndToEnd:
+    """End-to-end tests: real binary frames through parse_kiro_stream / collect_stream_to_result."""
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_yields_full_metering_dict(self):
+        """
+        What it does: Streams content and a metering frame with cache fields.
+        Goal: Ensure KiroEvent.usage carries the full metering dict.
+        """
+        metering = {"unit": "credit", "usage": 0.12, "cacheReadInputTokens": 1500}
+        stream = _event_frame("assistantResponseEvent", {"content": "hi"}) + _event_frame("meteringEvent", metering)
+        response = _response_with_chunks([stream])
+
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+            events = [e async for e in parse_kiro_stream(response, first_token_timeout=5)]
+
+        usage_events = [e for e in events if e.type == "usage"]
+        assert len(usage_events) == 1
+        assert usage_events[0].usage == metering
+
+    @pytest.mark.asyncio
+    async def test_collect_sets_exception_fields(self):
+        """
+        What it does: Collects a stream ending with an exception frame.
+        Goal: Ensure StreamResult carries exception type and message.
+        """
+        stream = _event_frame("assistantResponseEvent", {"content": "partial"})
+        stream += _exception_frame("ContentLengthExceededException", "too long")
+        response = _response_with_chunks([stream])
+
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+            result = await collect_stream_to_result(response, first_token_timeout=5)
+
+        assert result.content == "partial"
+        assert result.exception_type == "ContentLengthExceededException"
+        assert result.exception_message == "too long"
+
+    @pytest.mark.asyncio
+    async def test_collect_merges_metering_dicts(self):
+        """
+        What it does: Collects a stream with two metering frames.
+        Goal: Ensure fields from both are kept (later values win).
+        """
+        stream = _event_frame("meteringEvent", {"usage": 0.1, "unit": "credit"})
+        stream += _event_frame("meteringEvent", {"usage": 0.2, "cacheReadInputTokens": 7})
+        response = _response_with_chunks([stream])
+
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+            result = await collect_stream_to_result(response, first_token_timeout=5)
+
+        assert result.usage == {"usage": 0.2, "unit": "credit", "cacheReadInputTokens": 7}
+        assert result.exception_type is None
+
+    @pytest.mark.asyncio
+    async def test_chinese_text_split_across_network_chunks(self):
+        """
+        What it does: Splits a binary stream inside a Chinese character across chunks.
+        Goal: Ensure collected content is complete.
+        """
+        stream = _event_frame("assistantResponseEvent", {"content": "你好"})
+        stream += _event_frame("assistantResponseEvent", {"content": "世界"})
+        split = stream.index("好".encode("utf-8")) + 2
+        response = _response_with_chunks([stream[:split], stream[split:]])
+
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+            result = await collect_stream_to_result(response, first_token_timeout=5)
+
+        assert result.content == "你好世界"

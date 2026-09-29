@@ -1126,6 +1126,8 @@ class TestStreamingAnthropicContextUsage:
             tool_calls=[],
             context_usage_percentage=None,
             usage={"cacheReadInputTokens": 12, "cacheCreationInputTokens": 34},
+            exception_type=None,
+            exception_message=None,
         )
 
         with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
@@ -1382,7 +1384,8 @@ class TestStreamWithFirstTokenRetryAnthropic:
         # Error should be in Anthropic format (JSON)
         error_json = json.loads(str(exc_info.value))
         assert error_json["type"] == "error"
-        assert error_json["error"]["type"] == "api_error"
+        # 5xx is surfaced as overloaded_error so clients treat it as retryable
+        assert error_json["error"]["type"] == "overloaded_error"
         assert "Upstream API error" in error_json["error"]["message"]
         print("✓ Anthropic-formatted error raised on HTTP error")
     

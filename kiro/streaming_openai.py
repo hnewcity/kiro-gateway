@@ -30,7 +30,7 @@ Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 
 import json
 import time
-from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -50,7 +50,9 @@ from kiro.streaming_core import (
     parse_kiro_stream,
     FirstTokenTimeoutError,
     KiroEvent,
+    KiroStreamError,
     calculate_tokens_from_context_usage,
+    is_content_length_exception,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -63,6 +65,48 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+def _extract_credits_used(metering_data: Optional[Dict[str, Any]]) -> Optional[float]:
+    """
+    Extracts the credit amount from a Kiro metering dict.
+    
+    Args:
+        metering_data: Full metering dict, e.g. {"usage": 0.12, "unit": "credit", ...}
+    
+    Returns:
+        Credit amount (the "usage" field) or None if absent / not numeric
+    """
+    if not isinstance(metering_data, dict):
+        return None
+    credits = metering_data.get("usage")
+    if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+        return credits
+    return None
+
+
+def _format_openai_error_chunk(exception_type: str, exception_message: str) -> str:
+    """
+    Formats an upstream stream exception as an OpenAI-style SSE error chunk.
+    
+    Uses the same {"error": {...}} shape and "kiro_api_error" type that
+    routes_openai.py returns for upstream HTTP errors.
+    
+    Args:
+        exception_type: Upstream exception type
+        exception_message: Upstream exception message
+    
+    Returns:
+        SSE "data: ..." line
+    """
+    error_payload = {
+        "error": {
+            "message": exception_message or exception_type,
+            "type": "kiro_api_error",
+            "code": exception_type,
+        }
+    }
+    return f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
 
 
 # Re-export FirstTokenTimeoutError for backward compatibility
@@ -125,6 +169,7 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    content_length_exceeded = False  # Kiro sent ContentLengthExceededException
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -263,15 +308,30 @@ async def stream_kiro_to_openai_internal(
                 tool_calls_from_stream.append(event.tool_use)
             
             elif event.type == "usage" and event.usage:
-                metering_data = event.usage
+                # Full metering dict; merge in case Kiro sends several metering events
+                metering_data = {**(metering_data or {}), **event.usage}
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+            
+            elif event.type == "exception":
+                exception_type = event.exception_type or "UnknownException"
+                exception_message = event.exception_message or ""
+                if is_content_length_exception(exception_type):
+                    # Output hit the length limit: finish normally with finish_reason "length"
+                    logger.warning(f"Kiro reported {exception_type}: {exception_message[:200]}")
+                    content_length_exceeded = True
+                    continue
+                
+                # Any other upstream exception: surface it instead of pretending success
+                logger.error(f"Kiro stream exception: [{exception_type}] {exception_message[:500]}")
+                yield _format_openai_error_chunk(exception_type, exception_message)
+                raise KiroStreamError(exception_type, exception_message)
         
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
         received_context_usage = context_usage_percentage is not None
-        stream_completed_normally = received_usage or received_context_usage
+        stream_completed_normally = received_usage or received_context_usage or content_length_exceeded
         
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
@@ -293,8 +353,8 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine finish_reason (truncation / length limit has highest priority)
+        if content_was_truncated or content_length_exceeded:
             finish_reason = "length"
         elif all_tool_calls:
             finish_reason = "tool_calls"
@@ -415,8 +475,9 @@ async def stream_kiro_to_openai_internal(
             }
         }
         
-        if metering_data:
-            final_chunk["usage"]["credits_used"] = metering_data
+        credits_used = _extract_credits_used(metering_data)
+        if credits_used:
+            final_chunk["usage"]["credits_used"] = credits_used
         
         # Log final token values being sent to client
         logger.debug(
@@ -431,6 +492,10 @@ async def stream_kiro_to_openai_internal(
         
     except FirstTokenTimeoutError:
         # Propagate timeout up for retry
+        raise
+    except KiroStreamError:
+        # Upstream exception frame - already logged and reported to the client above
+        streaming_error_occurred = True
         raise
     except GeneratorExit:
         # Client disconnected - this is normal, don't log as error

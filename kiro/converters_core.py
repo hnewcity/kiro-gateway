@@ -31,7 +31,10 @@ to convert their formats to Kiro API format.
 """
 
 import base64
+import hashlib
 import json
+import re
+import os
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,8 +48,35 @@ from kiro.config import (
     FAKE_REASONING_BUDGET_CAP,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
+    KIRO_ADDITIONAL_MODEL_FIELDS,
+    KIRO_DEFAULT_CLAUDE_EFFORT,
+    KIRO_DEFAULT_GPT_EFFORT,
 )
-from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.payload_guards import (
+    EMPTY_CONTENT_FALLBACK,
+    TOOL_RESULT_ONLY_CONTENT,
+    check_payload_size,
+    repair_tool_pairing,
+    trim_payload_to_limit,
+)
+
+
+# ==================================================================================================
+# Converter-local Configuration
+# ==================================================================================================
+
+# Assistant reply paired with the system prompt history entry (matches Kiro CLI / reference)
+SYSTEM_PROMPT_ACKNOWLEDGEMENT = "I will follow these instructions."
+
+# Description of placeholder tool specs generated for tools referenced only in history
+PLACEHOLDER_TOOL_DESCRIPTION = "Tool used in conversation history"
+
+# Default efforts when the client does not send one (configurable in config.py)
+DEFAULT_CLAUDE_EFFORT = KIRO_DEFAULT_CLAUDE_EFFORT
+DEFAULT_GPT_EFFORT = KIRO_DEFAULT_GPT_EFFORT
+
+# Kiro schema enforces max_tokens >= 1024 in additionalModelRequestFields
+MIN_ADDITIONAL_MAX_TOKENS = 1024
 
 
 # ==================================================================================================
@@ -562,54 +592,214 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
+_SCHEMA_BASIC_TYPES = ("object", "array", "string", "number", "integer", "boolean")
+_SCHEMA_MAX_REF_DEPTH = 16
+_SCHEMA_DESCRIPTION_MAX_CHARS = 2000
+_SCHEMA_COMBINATOR_KEYS = ("anyOf", "oneOf", "allOf")
+
+
+def _extract_schema_defs(schema: Any) -> Dict[str, Any]:
+    """
+    Collect top-level `$defs` / `definitions` as the `$ref` resolution table.
+
+    Args:
+        schema: Root JSON Schema
+
+    Returns:
+        Mapping of definition name to schema
+    """
+    defs: Dict[str, Any] = {}
+    if isinstance(schema, dict):
+        for key in ("$defs", "definitions"):
+            table = schema.get(key)
+            if isinstance(table, dict):
+                defs.update(table)
+    return defs
+
+
+def _resolve_schema_refs(value: Any, defs: Dict[str, Any], depth: int) -> Any:
+    """
+    Recursively inline `#/$defs/<name>` and `#/definitions/<name>` references.
+
+    Sibling keys next to `$ref` (e.g. description) win over the target's keys.
+    Unresolvable refs (external URLs, OpenAPI paths, missing defs) and refs beyond
+    the depth limit (cycles) degrade to a permissive object schema.
+
+    Args:
+        value: Schema node
+        defs: Definition table from the root schema
+        depth: Current `$ref` expansion depth
+
+    Returns:
+        Schema node without `$ref`
+    """
+    if depth > _SCHEMA_MAX_REF_DEPTH:
+        return {"type": "object"}
+
+    if isinstance(value, list):
+        return [_resolve_schema_refs(item, defs, depth) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    obj = dict(value)
+    ref = obj.pop("$ref", None)
+    if isinstance(ref, str):
+        name: Optional[str] = None
+        for prefix in ("#/$defs/", "#/definitions/"):
+            if ref.startswith(prefix):
+                name = ref[len(prefix):]
+                break
+        target = defs.get(name) if name is not None else None
+        if isinstance(target, dict):
+            resolved = _resolve_schema_refs(target, defs, depth + 1)
+            if isinstance(resolved, dict):
+                for key, val in resolved.items():
+                    obj.setdefault(key, val)
+        else:
+            logger.debug(f"Unresolvable $ref in tool schema, degrading to permissive object: {ref}")
+            obj.setdefault("type", "object")
+
+    return {key: _resolve_schema_refs(val, defs, depth) for key, val in obj.items()}
+
+
+def _normalize_schema_type(raw: Any) -> Optional[str]:
+    """
+    Normalize a JSON Schema `type` value to a single basic type.
+
+    Args:
+        raw: `type` value (string or list of strings)
+
+    Returns:
+        Basic type name, or None if no supported type is present
+    """
+    candidates = raw if isinstance(raw, list) else [raw]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip() in _SCHEMA_BASIC_TYPES:
+            return candidate.strip()
+    return None
+
+
+def _collapse_schema_combinators(obj: Dict[str, Any]) -> None:
+    """
+    Remove anyOf/oneOf/allOf, keeping the single real branch when there is one.
+
+    Kiro rejects combinator schemas, so the reference drops them. As a strict
+    superset, when a combinator has exactly one non-null branch (the common
+    pydantic `Optional[X]` / `allOf: [{$ref}]` shapes) that branch's keys are
+    merged in (existing keys win) so the constraint is not lost.
+
+    Args:
+        obj: Schema object (mutated in place)
+    """
+    for key in _SCHEMA_COMBINATOR_KEYS:
+        variants = obj.pop(key, None)
+        if not isinstance(variants, list):
+            continue
+        branches = [
+            v for v in variants
+            if isinstance(v, dict) and v.get("type") != "null"
+        ]
+        if len(branches) == 1:
+            for branch_key, branch_value in branches[0].items():
+                if branch_key not in _SCHEMA_COMBINATOR_KEYS:
+                    obj.setdefault(branch_key, branch_value)
+
+
+def _normalize_schema_node(schema: Any, root: bool) -> Dict[str, Any]:
+    """
+    Normalize one schema node into the strict subset Kiro accepts.
+
+    Args:
+        schema: Schema node (refs already resolved)
+        root: Whether this is the root (always an object schema)
+
+    Returns:
+        Normalized schema with only type/properties/required/items/description/enum
+    """
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    obj = {key: val for key, val in schema.items() if val is not None}
+    _collapse_schema_combinators(obj)
+    obj = {key: val for key, val in obj.items() if val is not None}
+
+    normalized_type = _normalize_schema_type(obj.get("type"))
+    is_object = root or normalized_type == "object" or (
+        normalized_type is None and "properties" in obj
+    )
+
+    result: Dict[str, Any] = {}
+    if is_object:
+        result["type"] = "object"
+    elif normalized_type:
+        result["type"] = normalized_type
+
+    if is_object:
+        raw_props = obj.get("properties")
+        properties: Dict[str, Any] = {}
+        if isinstance(raw_props, dict):
+            for prop_name, prop_schema in raw_props.items():
+                properties[str(prop_name)] = _normalize_schema_node(prop_schema, False)
+        result["properties"] = properties
+
+        raw_required = obj.get("required")
+        required: List[str] = []
+        if isinstance(raw_required, list):
+            for name in raw_required:
+                if isinstance(name, str) and name in properties and name not in required:
+                    required.append(name)
+        # Kiro rejects empty required arrays - only emit when non-empty
+        if required:
+            result["required"] = required
+
+    items = obj.get("items")
+    if isinstance(items, list):
+        first = next((item for item in items if isinstance(item, dict)), None)
+        if first is not None:
+            result["items"] = _normalize_schema_node(first, False)
+    elif isinstance(items, dict):
+        result["items"] = _normalize_schema_node(items, False)
+
+    description = obj.get("description")
+    if isinstance(description, str):
+        result["description"] = description[:_SCHEMA_DESCRIPTION_MAX_CHARS]
+
+    enum_values = obj.get("enum")
+    if isinstance(enum_values, list):
+        scalars = [v for v in enum_values if isinstance(v, (str, int, float, bool))]
+        if scalars:
+            result["enum"] = scalars
+
+    # additionalProperties and all other keywords are dropped (Kiro strict mode)
+    return result
+
+
 def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Sanitizes JSON Schema from fields that Kiro API doesn't accept.
-    
-    Kiro API returns 400 "Improperly formed request" error if:
-    - required is an empty array []
-    - additionalProperties is present in schema
-    
-    This function recursively processes the schema and removes problematic fields.
-    
+    Normalizes a tool JSON Schema into the strict subset the Kiro API accepts.
+
+    Kiro returns 400 "Improperly formed request" for many valid JSON Schemas.
+    Port of kiro2cc-proxy schema.rs:
+    - `$ref` resolved against `$defs`/`definitions` (depth limit 16); unresolvable
+      refs become a permissive object; `$defs`/`definitions` dropped
+    - null values stripped; `type` arrays reduced to the first non-null basic type
+    - object schemas always get a dict `properties`; `required` keeps only strings
+      that exist in `properties` and is omitted when empty
+    - `items` must be a schema (first schema of a tuple list)
+    - anyOf/oneOf/allOf removed (single non-null branch merged in)
+    - keys whitelisted to type/properties/required/items/description/enum
+      (so `additionalProperties` is always dropped)
+    - the root is always an object schema
+
     Args:
         schema: JSON Schema to sanitize
-    
+
     Returns:
-        Sanitized copy of schema
+        Sanitized copy of schema (never mutates the input)
     """
-    if not schema:
-        return {}
-    
-    result = {}
-    
-    for key, value in schema.items():
-        # Skip empty required arrays
-        if key == "required" and isinstance(value, list) and len(value) == 0:
-            continue
-        
-        # Skip additionalProperties - Kiro API doesn't support it
-        if key == "additionalProperties":
-            continue
-        
-        # Recursively process nested objects
-        if key == "properties" and isinstance(value, dict):
-            result[key] = {
-                prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
-                for prop_name, prop_value in value.items()
-            }
-        elif isinstance(value, dict):
-            result[key] = sanitize_json_schema(value)
-        elif isinstance(value, list):
-            # Process lists (e.g., anyOf, oneOf)
-            result[key] = [
-                sanitize_json_schema(item) if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
-            result[key] = value
-    
-    return result
+    defs = _extract_schema_defs(schema)
+    resolved = _resolve_schema_refs(schema if schema is not None else {}, defs, 0)
+    return _normalize_schema_node(resolved, True)
 
 
 # ==================================================================================================
@@ -1466,9 +1656,14 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         if msg.role == "user":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
+            # Fallback for empty content - Kiro API requires non-empty content.
+            # A user turn that only carries tool results gets a neutral hint so the
+            # model answers based on the results instead of reading it as "continue".
             if not content:
-                content = "(empty placeholder)"
+                has_results = bool(msg.tool_results) or bool(
+                    extract_tool_results_from_content(msg.content)
+                )
+                content = TOOL_RESULT_ONLY_CONTENT if has_results else EMPTY_CONTENT_FALLBACK
             
             user_input = {
                 "content": content,
@@ -1508,20 +1703,259 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
+            # Process tool_calls
+            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
+            
+            # Fallback for empty content - Kiro API requires non-empty content.
+            # Assistant turns with only toolUses use a single space (reference behaviour).
+            if not content.strip():
+                content = " " if tool_uses else EMPTY_CONTENT_FALLBACK
             
             assistant_response = {"content": content}
             
-            # Process tool_calls
-            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
             
             history.append({"assistantResponseMessage": assistant_response})
     
     return history
+
+
+# ==================================================================================================
+# Envelope Helpers (agentContinuationId, agentTaskType, additionalModelRequestFields)
+# ==================================================================================================
+
+def derive_agent_continuation_id(conversation_id: str) -> str:
+    """
+    Derive a stable agentContinuationId from the conversationId.
+
+    Port of kiro2cc-proxy session.rs: SHA-256 over "agent-continuation:" + id,
+    first 16 bytes formatted as a UUID string. The same conversationId always
+    yields the same agentContinuationId.
+
+    Args:
+        conversation_id: Conversation ID sent in conversationState
+
+    Returns:
+        UUID-formatted lowercase hex string
+    """
+    digest = hashlib.sha256(b"agent-continuation:" + conversation_id.encode("utf-8")).hexdigest()
+    return f"{digest[0:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+
+def determine_agent_task_type(tools: Optional[List[UnifiedTool]]) -> str:
+    """
+    Determine conversationState.agentTaskType (reference convert.rs).
+
+    Args:
+        tools: Tools declared by the client
+
+    Returns:
+        "spectask" when any tool is declared, otherwise "vibe"
+    """
+    return "spectask" if tools else "vibe"
+
+
+def is_gpt_model(model_id: str) -> bool:
+    """
+    Check whether the Kiro model ID belongs to the GPT family.
+
+    Args:
+        model_id: Kiro model ID
+
+    Returns:
+        True for gpt-* models
+    """
+    return model_id.lower().startswith("gpt-")
+
+
+def additional_fields_skipped(model_id: str) -> bool:
+    """
+    Check whether additionalModelRequestFields must be omitted for a model.
+
+    Kiro rejects the field for the "4.5" generation (sonnet/opus/haiku 4.5) with
+    400 REQUEST_BODY_INVALID (reference thinking.rs). Legacy claude-3.x models
+    are also skipped (the reference never sends to them), as are non-Claude,
+    non-GPT models whose schema is unknown.
+
+    Args:
+        model_id: Kiro model ID
+
+    Returns:
+        True if the field must not be sent
+    """
+    m = model_id.lower()
+    if is_gpt_model(m):
+        return False
+    if not m.startswith("claude-"):
+        return True
+    # Only send to generations known to accept it (>= 4.6). Kiro rejects it for
+    # claude-3.x, 4.0 (verified: claude-sonnet-4) and 4.5 with REQUEST_BODY_INVALID.
+    version = _claude_version(m)
+    return version is None or version < (4, 6)
+
+
+def _claude_version(model_id: str) -> Optional[tuple]:
+    """
+    Extracts (major, minor) from a Claude model ID.
+
+    Handles "claude-sonnet-4.5", "claude-sonnet-4-5", "claude-opus-5", "claude-3.7-sonnet".
+
+    Args:
+        model_id: Lower-case Kiro model ID
+
+    Returns:
+        (major, minor) tuple, or None if no version found
+    """
+    match = re.search(r"(?<![\d])(\d+)(?:[.-](\d)(?![\d]))?", model_id)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def model_max_output_tokens(model_id: str) -> int:
+    """
+    Kiro max_tokens upper bound per model generation (reference fields.rs).
+
+    Args:
+        model_id: Kiro model ID
+
+    Returns:
+        128000 for opus 4.7 / 4.8 / 5.x, otherwise 64000
+    """
+    m = model_id.lower()
+    if any(tag in m for tag in ("opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8", "opus-5", "opus.5", "opus 5")):
+        return 128000
+    return 64000
+
+
+def _extract_effort(output_config: Any) -> Optional[str]:
+    """
+    Read `effort` from an Anthropic output_config (dict or object).
+
+    Args:
+        output_config: output_config value from the client request
+
+    Returns:
+        Non-empty effort string, or None
+    """
+    if output_config is None:
+        return None
+    effort = output_config.get("effort") if isinstance(output_config, dict) else getattr(output_config, "effort", None)
+    if isinstance(effort, str) and effort.strip():
+        return effort.strip()
+    return None
+
+
+def build_additional_model_request_fields(
+    model_id: str,
+    max_tokens: Optional[int] = None,
+    output_config: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build top-level additionalModelRequestFields (port of reference fields.rs).
+
+    - Disabled entirely by KIRO_ADDITIONAL_MODEL_FIELDS=false
+    - Skipped for models in additional_fields_skipped() (4.5 generation etc.)
+    - GPT family: {"reasoning": {"effort": <effort or "high">}}
+    - Claude: {"output_config": {"effort": <effort or "low">},
+               "max_tokens": clamp(max_tokens, 1024, model cap)} (max_tokens only if > 0)
+    - The `thinking` field is intentionally never sent (reference: adds TTFB)
+
+    Args:
+        model_id: Kiro model ID
+        max_tokens: Client max_tokens (None/0 = omit)
+        output_config: Client output_config (dict with "effort"), optional
+
+    Returns:
+        Fields dict, or None when nothing should be sent
+    """
+    if not KIRO_ADDITIONAL_MODEL_FIELDS or additional_fields_skipped(model_id):
+        return None
+
+    effort = _extract_effort(output_config)
+
+    if is_gpt_model(model_id):
+        return {"reasoning": {"effort": effort or DEFAULT_GPT_EFFORT}}
+
+    fields: Dict[str, Any] = {"output_config": {"effort": effort or DEFAULT_CLAUDE_EFFORT}}
+    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+        capped = min(max_tokens, model_max_output_tokens(model_id))
+        fields["max_tokens"] = max(capped, MIN_ADDITIONAL_MAX_TOKENS)
+    return fields
+
+
+def build_placeholder_tool_specs(
+    history: List[Dict[str, Any]],
+    kiro_tools: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Create minimal tool specs for toolUse names in history that are not declared.
+
+    Kiro requires every tool referenced in history to be defined in
+    currentMessage tools. Names are compared case-insensitively (Kiro matches
+    tool names ignoring case). Reference: websearch.rs create_placeholder_tool.
+
+    Args:
+        history: Kiro-format history (after pairing cleanup)
+        kiro_tools: Declared tools in Kiro toolSpecification format
+
+    Returns:
+        Placeholder specs to append to the tools list (may be empty)
+    """
+    known = {
+        str(t.get("toolSpecification", {}).get("name", "")).lower()
+        for t in kiro_tools
+    }
+    placeholders: List[Dict[str, Any]] = []
+    for entry in history:
+        assistant = entry.get("assistantResponseMessage")
+        if not assistant:
+            continue
+        for tool_use in assistant.get("toolUses") or []:
+            name = tool_use.get("name") if isinstance(tool_use, dict) else None
+            if not name or name.lower() in known:
+                continue
+            known.add(name.lower())
+            placeholders.append({
+                "toolSpecification": {
+                    "name": name,
+                    "description": PLACEHOLDER_TOOL_DESCRIPTION,
+                    "inputSchema": {"json": {"type": "object", "properties": {}}},
+                }
+            })
+    if placeholders:
+        logger.debug(
+            f"Added {len(placeholders)} placeholder tool definition(s) for history-only tools: "
+            f"{[p['toolSpecification']['name'] for p in placeholders]}"
+        )
+    return placeholders
+
+
+def drop_trailing_assistant_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessage]:
+    """
+    Drop trailing assistant messages (prefill) - Kiro does not support prefill.
+
+    Reference convert.rs: the conversation is truncated after the last non-assistant
+    message. Unknown roles count as user (they are normalized later).
+
+    Args:
+        messages: Messages in unified format
+
+    Returns:
+        New list without trailing assistant messages (input is not mutated).
+        An assistant-only list is returned unchanged.
+    """
+    end = len(messages)
+    while end > 0 and messages[end - 1].role == "assistant":
+        end -= 1
+    if end == 0:
+        # Assistant-only conversation: nothing to answer. Keep it unchanged and let
+        # build_kiro_payload move the assistant turn into history (legacy behaviour).
+        return list(messages)
+    if end != len(messages):
+        logger.info(f"Dropping {len(messages) - end} trailing assistant message(s) (prefill is not supported by Kiro)")
+    return list(messages[:end])
 
 
 # ==================================================================================================
@@ -1535,13 +1969,23 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    max_tokens: Optional[int] = None,
+    output_config: Optional[Any] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
     
     This is the main function that assembles the Kiro API payload from
     API-agnostic unified message and tool formats.
+
+    Layout:
+    - history[0..1]: system prompt as user {system} + assistant
+      "I will follow these instructions." (only when a system prompt exists)
+    - history[2..]: conversation turns (trailing assistant prefill dropped)
+    - currentMessage: last user turn with tools (+ placeholders) and toolResults
+    - conversationState.agentTaskType / agentContinuationId envelope fields
+    - top-level additionalModelRequestFields (gated by KIRO_ADDITIONAL_MODEL_FIELDS)
     
     Args:
         messages: List of messages in unified format (without system messages)
@@ -1551,6 +1995,8 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        max_tokens: Client max output tokens (for additionalModelRequestFields), optional
+        output_config: Client output_config ({"effort": ...}), optional
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1578,17 +2024,17 @@ def build_kiro_payload(
     truncation_system_addition = get_truncation_recovery_system_addition()
     if truncation_system_addition:
         full_system_prompt = full_system_prompt + truncation_system_addition if full_system_prompt else truncation_system_addition.strip()
+
+    # Kiro does not support assistant prefill - drop trailing assistant messages
+    messages = drop_trailing_assistant_messages(messages)
     
     # If no tools are defined, strip ALL tool-related content from messages
     # Kiro API rejects requests with toolResults but no tools
     if not tools:
-        messages_without_tools, had_tool_content = strip_all_tool_content(messages)
-        messages_with_assistants = messages_without_tools
-        converted_tool_results = had_tool_content
+        messages_with_assistants, _ = strip_all_tool_content(messages)
     else:
-        # Ensure assistant messages exist before tool_results (Kiro API requirement)
-        # Also returns flag if any tool_results were converted (to skip thinking tag injection)
-        messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages)
+        # Tool results without a preceding assistant tool call are converted to text
+        messages_with_assistants, _ = ensure_assistant_before_tool_results(messages)
     
     # Merge adjacent messages with the same role
     merged_messages = merge_adjacent_messages(messages_with_assistants)
@@ -1608,39 +2054,40 @@ def build_kiro_payload(
     if not merged_messages:
         raise ValueError("No messages to send")
     
-    # Build history (all messages except the last one)
-    history_messages = merged_messages[:-1] if len(merged_messages) > 1 else []
-    
-    # If there's a system prompt, add it to the first user message in history
-    if full_system_prompt and history_messages:
-        first_msg = history_messages[0]
-        if first_msg.role == "user":
-            original_content = extract_text_content(first_msg.content)
-            first_msg.content = f"{full_system_prompt}\n\n{original_content}"
-    
-    history = build_kiro_history(history_messages, model_id)
-    
-    # Current message (the last one)
+    # History = all messages except the last one; current = last (always user after prefill drop)
+    history_messages = merged_messages[:-1]
     current_message = merged_messages[-1]
+    if current_message.role == "assistant":
+        # Only reachable for assistant-only conversations (see drop_trailing_assistant_messages)
+        history_messages = merged_messages
+        current_message = UnifiedMessage(role="user", content="")
+    history = build_kiro_history(history_messages, model_id)
     current_content = extract_text_content(current_message.content)
     
-    # If system prompt exists but history is empty - add to current message
-    if full_system_prompt and not history:
-        current_content = f"{full_system_prompt}\n\n{current_content}"
-    
-    # If current message is assistant, need to add it to history
-    # and create user message placeholder
-    if current_message.role == "assistant":
-        history.append({
-            "assistantResponseMessage": {
-                "content": current_content
-            }
-        })
-        current_content = "(empty placeholder)"
-    
-    # If content is empty - use placeholder
+    # Tool results of the current message (Kiro format)
+    if current_message.tool_results:
+        current_tool_results = convert_tool_results_to_kiro_format(current_message.tool_results)
+    else:
+        current_tool_results = extract_tool_results_from_content(current_message.content)
+
+    # Enforce toolUse/toolResult pairing: drop duplicate results, convert orphaned
+    # results to text, remove toolUses that never get a result
+    current_tool_results, current_orphan_text = repair_tool_pairing(history, current_tool_results)
+    if current_orphan_text:
+        current_content = f"{current_content}\n\n{current_orphan_text}" if current_content else current_orphan_text
+
+    # Empty content fallbacks
     if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = TOOL_RESULT_ONLY_CONTENT if current_tool_results else EMPTY_CONTENT_FALLBACK
+
+    # System prompt as a separate leading user/assistant pair (stable prefix)
+    system_prefix_entries = 0
+    if full_system_prompt:
+        history = [
+            {"userInputMessage": {"content": full_system_prompt, "modelId": model_id, "origin": "AI_EDITOR"}},
+            {"assistantResponseMessage": {"content": SYSTEM_PROMPT_ACKNOWLEDGEMENT}},
+        ] + history
+        system_prefix_entries = 2
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
@@ -1655,26 +2102,17 @@ def build_kiro_payload(
     # Build user_input_context for tools and toolResults only (NOT images)
     user_input_context: Dict[str, Any] = {}
     
-    # Add tools if present
+    # Add tools if present, plus placeholder specs for tools referenced only in history
     kiro_tools = convert_tools_to_kiro_format(processed_tools)
     if kiro_tools:
+        kiro_tools.extend(build_placeholder_tool_specs(history, kiro_tools))
         user_input_context["tools"] = kiro_tools
     
-    # Process tool_results in current message - convert to Kiro format if present
-    if current_message.tool_results:
-        # Convert unified format to Kiro format
-        kiro_tool_results = convert_tool_results_to_kiro_format(current_message.tool_results)
-        if kiro_tool_results:
-            user_input_context["toolResults"] = kiro_tool_results
-    else:
-        # Try to extract from content (already in Kiro format)
-        tool_results = extract_tool_results_from_content(current_message.content)
-        if tool_results:
-            user_input_context["toolResults"] = tool_results
+    if current_tool_results:
+        user_input_context["toolResults"] = current_tool_results
     
-    # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
-        current_content = inject_thinking_tags(current_content, thinking_config)
+    # Inject thinking tags if enabled (current user message only)
+    current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
     user_input_message = {
@@ -1692,8 +2130,10 @@ def build_kiro_payload(
         user_input_message["userInputMessageContext"] = user_input_context
     
     # Assemble final payload
-    payload = {
+    payload: Dict[str, Any] = {
         "conversationState": {
+            "agentContinuationId": derive_agent_continuation_id(conversation_id),
+            "agentTaskType": determine_agent_task_type(tools),
             "chatTriggerType": "MANUAL",
             "conversationId": conversation_id,
             "currentMessage": {
@@ -1710,11 +2150,18 @@ def build_kiro_payload(
     if profile_arn:
         payload["profileArn"] = profile_arn
 
-    # Payload size guard — auto-trim if enabled
+    # Model-specific request fields (top level, next to conversationState)
+    additional_fields = build_additional_model_request_fields(model_id, max_tokens, output_config)
+    if additional_fields:
+        payload["additionalModelRequestFields"] = additional_fields
+
+    # Payload size guard — auto-trim if enabled (system prompt pair is never trimmed)
     if AUTO_TRIM_PAYLOAD:
         payload_size = check_payload_size(payload)
         if payload_size > KIRO_MAX_PAYLOAD_BYTES:
-            stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)
+            stats = trim_payload_to_limit(
+                payload, KIRO_MAX_PAYLOAD_BYTES, keep_prefix_entries=system_prefix_entries
+            )
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_bytes} -> {stats.final_bytes} bytes)"

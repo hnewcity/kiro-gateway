@@ -26,7 +26,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY
+from kiro.config import PROXY_API_KEY, SSE_PING_INTERVAL, STABLE_CONVERSATION_ID
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -49,10 +49,12 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+    stream_error_event,
+    with_sse_pings,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.profile_arn import profile_arn_for_payload
-from kiro.utils import generate_conversation_id
+from kiro.utils import derive_conversation_id, generate_conversation_id
 from kiro.tokenizer import count_message_tokens, count_tools_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -115,6 +117,67 @@ async def verify_anthropic_api_key(
 
 # --- Router ---
 router = APIRouter(tags=["Anthropic API"])
+
+
+def _stable_conversation_id(request_data: Any) -> str:
+    """
+    Derives a stable Kiro conversationId for an Anthropic request.
+
+    Args:
+        request_data: AnthropicMessagesRequest
+
+    Returns:
+        UUID-formatted conversation ID (stable across turns of one conversation)
+    """
+    if not STABLE_CONVERSATION_ID:
+        return generate_conversation_id()
+    tool_names = [getattr(t, "name", "") or "" for t in (request_data.tools or [])]
+    first_message = request_data.messages[0].content if request_data.messages else None
+    return derive_conversation_id(
+        request_data.metadata, request_data.system, tool_names, first_message
+    )
+
+
+def _anthropic_upstream_error_response(
+    status_code: int,
+    reason: Optional[str],
+    message: str,
+    model_cache: Any,
+    model: str,
+) -> JSONResponse:
+    """
+    Builds an Anthropic-format error response for an upstream Kiro error.
+
+    Args:
+        status_code: Upstream HTTP status
+        reason: Kiro error reason (may be None)
+        message: User-facing message
+        model_cache: Model cache for max input tokens (may be None)
+        model: Requested model name
+
+    Returns:
+        JSONResponse with Anthropic error body and headers
+    """
+    from kiro.kiro_errors import map_upstream_error_for_anthropic
+
+    max_input_tokens = 200000
+    if model_cache is not None:
+        try:
+            max_input_tokens = int(model_cache.get_max_input_tokens(model))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    mapping = map_upstream_error_for_anthropic(
+        status_code or 500, reason or "UNKNOWN", message or "Upstream error",
+        max_input_tokens=max_input_tokens,
+    )
+    return JSONResponse(
+        status_code=mapping.status_code,
+        headers=mapping.headers or None,
+        content={
+            "type": "error",
+            "error": {"type": mapping.error_type, "message": mapping.message},
+        },
+    )
 
 
 @router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])
@@ -328,6 +391,7 @@ async def messages(
         
         last_error_message = None
         last_error_status = None
+        last_error_reason = None
         tried_accounts = set()  # Track tried accounts in current failover loop
         
         for attempt in range(MAX_ATTEMPTS):
@@ -376,7 +440,7 @@ async def messages(
             model_resolver = account.model_resolver
             
             # Generate conversation ID
-            conversation_id = generate_conversation_id()
+            conversation_id = _stable_conversation_id(request_data)
             
             # Build payload for Kiro
             selected_profile_arn = profile_arn_for_payload(auth_manager)
@@ -445,14 +509,14 @@ async def messages(
                                         "POST", url, kiro_payload, stream=True
                                     )
                                 
-                                async for chunk in stream_with_first_token_retry_anthropic(
+                                async for chunk in with_sse_pings(stream_with_first_token_retry_anthropic(
                                     make_request=make_retry_request,
                                     model=request_data.model,
                                     model_cache=model_cache,
                                     auth_manager=auth_manager,
                                     initial_response=response,
                                     request_messages=messages_for_tokenizer,
-                                ):
+                                ), SSE_PING_INTERVAL):
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -460,7 +524,7 @@ async def messages(
                             except Exception as e:
                                 streaming_error = e
                                 try:
-                                    error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                                    error_event = stream_error_event(e)
                                     yield error_event
                                 except Exception:
                                     pass
@@ -525,6 +589,7 @@ async def messages(
                         from kiro.kiro_errors import enhance_kiro_error
                         error_info = enhance_kiro_error(error_json)
                         error_reason = error_info.reason
+                        last_error_reason = error_reason
                         last_error_message = error_info.user_message
                         last_error_status = response.status_code
                         logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
@@ -547,23 +612,11 @@ async def messages(
                         if debug_logger:
                             debug_logger.flush_on_error(response.status_code, last_error_message)
 
-                        # Map context overflow to the Anthropic error type Claude Code
-                        # recognises, so /compact and auto-retry can recover natively
-                        # instead of treating it as a generic API failure.
-                        anthropic_error_type = (
-                            "invalid_request_error"
-                            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
-                            else "api_error"
-                        )
-                        return JSONResponse(
-                            status_code=response.status_code,
-                            content={
-                                "type": "error",
-                                "error": {
-                                    "type": anthropic_error_type,
-                                    "message": last_error_message
-                                }
-                            }
+                        # Map to Anthropic error types Claude Code recognises
+                        # (compact on overflow, back off on 429/overload).
+                        return _anthropic_upstream_error_response(
+                            response.status_code, error_reason, last_error_message,
+                            model_cache, request_data.model,
                         )
                     
                     else:  # ErrorType.RECOVERABLE
@@ -630,15 +683,9 @@ async def messages(
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
-            return JSONResponse(
-                status_code=last_error_status,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": last_error_message
-                    }
-                }
+            return _anthropic_upstream_error_response(
+                last_error_status, last_error_reason, last_error_message,
+                None, request_data.model,
             )
         else:
             # Multiple accounts - generic error with context
@@ -682,7 +729,7 @@ async def messages(
     # ==============================================================================
     
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
+    conversation_id = _stable_conversation_id(request_data)
     
     # Build payload for Kiro
     selected_profile_arn = profile_arn_for_payload(auth_manager)
@@ -777,23 +824,11 @@ async def messages(
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
 
-            # Map context overflow to the Anthropic error type Claude Code recognises,
-            # so /compact and auto-retry can recover natively.
-            anthropic_error_type = (
-                "invalid_request_error"
-                if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
-                else "api_error"
-            )
-            # Return error in Anthropic format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": anthropic_error_type,
-                        "message": error_message
-                    }
-                }
+            # Map to Anthropic error types Claude Code recognises
+            # (compact on overflow, back off on 429/overload).
+            return _anthropic_upstream_error_response(
+                response.status_code, error_reason, error_message,
+                model_cache, request_data.model,
             )
         
         if request_data.stream:
@@ -809,14 +844,14 @@ async def messages(
                         )
                     
                     # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
+                    async for chunk in with_sse_pings(stream_with_first_token_retry_anthropic(
                         make_request=make_retry_request,
                         model=request_data.model,
                         model_cache=model_cache,
                         auth_manager=auth_manager,
                         initial_response=response,
                         request_messages=messages_for_tokenizer,
-                    ):
+                    ), SSE_PING_INTERVAL):
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -825,7 +860,7 @@ async def messages(
                     streaming_error = e
                     # Send error event to client, then gracefully end the stream
                     try:
-                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                        error_event = stream_error_event(e)
                         yield error_event
                     except Exception:
                         pass

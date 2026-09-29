@@ -25,9 +25,10 @@ and other common utilities.
 """
 
 import hashlib
+import re
 import json
 import uuid
-from typing import TYPE_CHECKING, List, Dict, Any
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
 
 from loguru import logger
 
@@ -58,7 +59,13 @@ def get_machine_fingerprint() -> str:
         return hashlib.sha256(b"default-kiro-gateway").hexdigest()
 
 
-def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+def get_kiro_headers(
+    auth_manager: "KiroAuthManager",
+    token: str,
+    amz_target: Optional[str] = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+    attempt: int = 1,
+    agent_mode: str = "vibe",
+) -> dict:
     """
     Builds headers for Kiro API requests.
     
@@ -70,23 +77,28 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     Args:
         auth_manager: Authentication manager for obtaining fingerprint
         token: Access token for authorization
+        amz_target: x-amz-target value, or None to omit the header (endpoint-specific)
+        attempt: 1-based attempt number reported in amz-sdk-request
+        agent_mode: x-amzn-kiro-agent-mode value ("vibe" or "spectask")
     
     Returns:
         Dictionary with headers for HTTP request
     """
     fingerprint = auth_manager.fingerprint
     
-    return {
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
-        "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
         "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
         "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
         "x-amzn-codewhisperer-optout": "true",
-        "x-amzn-kiro-agent-mode": "vibe",
+        "x-amzn-kiro-agent-mode": agent_mode,
         "amz-sdk-invocation-id": str(uuid.uuid4()),
-        "amz-sdk-request": "attempt=1; max=3",
+        "amz-sdk-request": f"attempt={attempt}; max=3",
     }
+    if amz_target:
+        headers["x-amz-target"] = amz_target
+    return headers
 
 
 def generate_completion_id() -> str:
@@ -171,3 +183,99 @@ def generate_tool_call_id() -> str:
         ID in format "call_{uuid_hex[:8]}"
     """
     return f"call_{uuid.uuid4().hex[:8]}"
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _is_uuid(value: str) -> bool:
+    """Returns True if value is a canonical UUID string."""
+    return bool(_UUID_RE.match(value or ""))
+
+
+def extract_session_id(user_id: Optional[str]) -> Optional[str]:
+    """
+    Extracts a client session UUID from Anthropic metadata.user_id.
+
+    Supports the formats Claude Code sends:
+    - plain UUID
+    - JSON string {"session_id": "..."} or {"id": "..."}
+    - legacy "user_<hash>_account__session_<uuid>"
+
+    Args:
+        user_id: metadata.user_id value
+
+    Returns:
+        Lower-case session UUID, or None if none found
+    """
+    if not user_id or not isinstance(user_id, str):
+        return None
+    if _is_uuid(user_id):
+        return user_id.lower()
+    if user_id.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(user_id)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("session_id", "id"):
+                candidate = parsed.get(key)
+                if isinstance(candidate, str) and _is_uuid(candidate):
+                    return candidate.lower()
+    pos = user_id.find("session_")
+    if pos != -1:
+        candidate = user_id[pos + 8:pos + 8 + 36]
+        if _is_uuid(candidate):
+            return candidate.lower()
+    return None
+
+
+def derive_conversation_id(
+    metadata: Optional[Dict[str, Any]],
+    system: Any = None,
+    tool_names: Optional[List[str]] = None,
+    first_message: Any = None,
+) -> str:
+    """
+    Derives a stable Kiro conversationId for a client conversation.
+
+    Kiro can reuse server-side state across requests of the same conversation,
+    which a random ID per request defeats. Priority:
+    1. session UUID from metadata.user_id (Claude Code)
+    2. SHA-256 of system + sorted tool names + first message (first 4096 chars)
+
+    Args:
+        metadata: Anthropic request metadata
+        system: System prompt (str or list of blocks)
+        tool_names: Declared tool names
+        first_message: Content of the first message
+
+    Returns:
+        UUID-formatted conversation ID
+    """
+    user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+    session_id = extract_session_id(user_id)
+    if session_id:
+        return session_id
+
+    def _text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(value)
+
+    # Claude Code's billing header line changes per request; keep it out of the hash
+    system_text = "\n".join(
+        line for line in _text(system).splitlines()
+        if "x-anthropic-billing-header" not in line
+    )
+    hasher = hashlib.sha256()
+    hasher.update(system_text.encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(",".join(sorted(tool_names or [])).encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(_text(first_message)[:4096].encode("utf-8"))
+    return str(uuid.UUID(bytes=hasher.digest()[:16], version=4))

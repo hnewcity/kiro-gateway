@@ -212,6 +212,48 @@ MAX_RETRIES: int = 3
 # Uses exponential backoff: delay * (2 ** attempt)
 BASE_RETRY_DELAY: float = 1.0
 
+# Upper bound for exponential backoff on 5xx/408/network errors (seconds)
+MAX_RETRY_DELAY: float = float(os.getenv("MAX_RETRY_DELAY", "5"))
+
+# 429 backoff: THROTTLE_BASE_DELAY + attempt * THROTTLE_STEP_DELAY, capped, plus jitter.
+# Retry-After from upstream (when present) takes precedence, capped at THROTTLE_MAX_DELAY.
+THROTTLE_BASE_DELAY: float = float(os.getenv("THROTTLE_BASE_DELAY", "2"))
+THROTTLE_STEP_DELAY: float = float(os.getenv("THROTTLE_STEP_DELAY", "1"))
+THROTTLE_MAX_DELAY: float = float(os.getenv("THROTTLE_MAX_DELAY", "8"))
+
+# Kiro upstream endpoints for generateAssistantResponse, tried in order on 429.
+# Each endpoint is reported to have an independent rate-limit bucket.
+#   runtime       -> runtime.{region}.kiro.dev (default, the only one enabled by default)
+#   ide           -> q.{region}.amazonaws.com
+#   codewhisperer -> codewhisperer.us-east-1.amazonaws.com (q.{region} elsewhere) + x-amz-target
+#   amazonq       -> q.{region}.amazonaws.com + x-amz-target SendMessage
+# Example: KIRO_ENDPOINTS="runtime,ide,codewhisperer"
+KIRO_ENDPOINTS: list = [
+    e.strip().lower()
+    for e in os.getenv("KIRO_ENDPOINTS", "runtime").split(",")
+    if e.strip()
+]
+
+# How long an endpoint is skipped after it returned 429 (seconds)
+ENDPOINT_THROTTLE_SECONDS: float = float(os.getenv("ENDPOINT_THROTTLE_SECONDS", "30"))
+
+
+# Derive a stable Kiro conversationId per client conversation (metadata.user_id session,
+# else hash of system + tools + first message) instead of a random UUID per request.
+# Lets Kiro reuse server-side conversation state / prompt cache. Set "false" to A/B test.
+STABLE_CONVERSATION_ID: bool = os.getenv("STABLE_CONVERSATION_ID", "true").lower() in ("true", "1", "yes")
+
+# Send additionalModelRequestFields (output_config.effort / max_tokens / reasoning.effort) to Kiro.
+KIRO_ADDITIONAL_MODEL_FIELDS: bool = os.getenv("KIRO_ADDITIONAL_MODEL_FIELDS", "true").lower() in ("true", "1", "yes")
+
+# Effort sent when the client does not specify one. The reference proxy uses "low"
+# for Claude to cut time-to-first-token; raise it if you prefer deeper reasoning.
+KIRO_DEFAULT_CLAUDE_EFFORT: str = os.getenv("KIRO_DEFAULT_CLAUDE_EFFORT", "low")
+KIRO_DEFAULT_GPT_EFFORT: str = os.getenv("KIRO_DEFAULT_GPT_EFFORT", "high")
+
+# Interval for SSE ping events sent to Anthropic clients while waiting on upstream (seconds, 0 = off)
+SSE_PING_INTERVAL: float = float(os.getenv("SSE_PING_INTERVAL", "25"))
+
 # ==================================================================================================
 # Hidden Models Configuration
 # ==================================================================================================

@@ -68,14 +68,19 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool_use, usage, context_usage, exception)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
-        usage: Usage/metering data (for usage events)
+        usage: Full metering dict (for usage events), e.g.
+            {"usage": 0.12, "unit": "credit", "cacheReadInputTokens": 100}.
+            The credit amount is under the "usage" key.
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
+        exception_type: Upstream exception type (for exception events),
+            e.g. "ContentLengthExceededException"
+        exception_message: Upstream exception message (for exception events)
     """
     type: str
     content: Optional[str] = None
@@ -85,6 +90,8 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    exception_type: Optional[str] = None
+    exception_message: Optional[str] = None
 
 
 @dataclass
@@ -96,14 +103,53 @@ class StreamResult:
         content: Full text content
         thinking_content: Full thinking/reasoning content
         tool_calls: List of tool calls
-        usage: Usage information
+        usage: Full metering dict (merged across metering events)
         context_usage_percentage: Context usage percentage from Kiro API
+        exception_type: Type of the last upstream exception event, if any
+        exception_message: Message of the last upstream exception event, if any
     """
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    exception_type: Optional[str] = None
+    exception_message: Optional[str] = None
+
+
+class KiroStreamError(Exception):
+    """
+    Exception raised when Kiro reports an exception/error frame mid-stream.
+    
+    Attributes:
+        exception_type: Upstream exception type (e.g. "ThrottlingException")
+        exception_message: Upstream exception message
+    """
+    
+    def __init__(self, exception_type: str, exception_message: str) -> None:
+        """
+        Initializes the error.
+        
+        Args:
+            exception_type: Upstream exception type
+            exception_message: Upstream exception message
+        """
+        self.exception_type = exception_type
+        self.exception_message = exception_message
+        super().__init__(f"Kiro API stream exception [{exception_type}]: {exception_message}")
+
+
+def is_content_length_exception(exception_type: Optional[str]) -> bool:
+    """
+    Checks whether an upstream exception means the output length limit was hit.
+    
+    Args:
+        exception_type: Upstream exception type
+    
+    Returns:
+        True for ContentLengthExceeded* exceptions
+    """
+    return bool(exception_type) and "ContentLengthExceeded" in exception_type
 
 
 class FirstTokenTimeoutError(Exception):
@@ -280,6 +326,14 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] == "exception":
+            data = event.get("data") or {}
+            yield KiroEvent(
+                type="exception",
+                exception_type=data.get("exception_type") or "UnknownException",
+                exception_message=data.get("message") or "",
+            )
 
 
 # ==================================================================================================
@@ -318,9 +372,12 @@ async def collect_stream_to_result(
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:
-            result.usage = event.usage
+            result.usage = {**(result.usage or {}), **event.usage}
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
+        elif event.type == "exception":
+            result.exception_type = event.exception_type
+            result.exception_message = event.exception_message
     
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)

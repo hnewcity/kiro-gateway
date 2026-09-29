@@ -139,3 +139,81 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         user_message=user_message,
         original_message=original_message
     )
+
+
+@dataclass
+class AnthropicErrorMapping:
+    """
+    How an upstream Kiro error should be presented to an Anthropic client.
+
+    Attributes:
+        status_code: HTTP status to return
+        error_type: Anthropic error type (invalid_request_error, rate_limit_error, ...)
+        message: Error message
+        headers: Extra response headers (e.g. Retry-After)
+    """
+    status_code: int
+    error_type: str
+    message: str
+    headers: Dict[str, str]
+
+
+def format_prompt_too_long(estimated_tokens: int, max_tokens: int) -> str:
+    """
+    Formats a context overflow message in Anthropic's official wording.
+
+    Claude Code recognises "prompt is too long: N tokens > M maximum" and can
+    compact + retry; custom wording is treated as a hard failure. N is forced
+    above M so the message is never self-contradictory.
+
+    Args:
+        estimated_tokens: Local estimate of the prompt size
+        max_tokens: Model's max input tokens
+
+    Returns:
+        Formatted message
+    """
+    n = max(int(estimated_tokens or 0), int(max_tokens) + 1)
+    return f"prompt is too long: {n} tokens > {int(max_tokens)} maximum"
+
+
+def map_upstream_error_for_anthropic(
+    status_code: int,
+    reason: str,
+    message: str,
+    estimated_tokens: int = 0,
+    max_input_tokens: int = 200000,
+) -> AnthropicErrorMapping:
+    """
+    Maps a Kiro HTTP error to an Anthropic error response.
+
+    - Context overflow -> 400 invalid_request_error with official wording
+    - Monthly quota    -> 402 billing_error (not retryable)
+    - 429              -> 429 rate_limit_error + Retry-After so clients back off
+    - 5xx / 408        -> original status, overloaded_error (retryable)
+    - Everything else  -> original status, api_error / invalid_request_error for 400
+
+    Args:
+        status_code: Upstream HTTP status
+        reason: Kiro error reason (may be "UNKNOWN")
+        message: Already-enhanced user message
+        estimated_tokens: Local prompt size estimate (for overflow wording)
+        max_input_tokens: Model's max input tokens
+
+    Returns:
+        AnthropicErrorMapping
+    """
+    if reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD":
+        return AnthropicErrorMapping(
+            400, "invalid_request_error",
+            format_prompt_too_long(estimated_tokens, max_input_tokens), {},
+        )
+    if reason == "MONTHLY_REQUEST_COUNT":
+        return AnthropicErrorMapping(402, "billing_error", message, {})
+    if status_code == 429:
+        return AnthropicErrorMapping(429, "rate_limit_error", message, {"Retry-After": "5"})
+    if status_code == 408 or status_code >= 500:
+        return AnthropicErrorMapping(status_code, "overloaded_error", message, {})
+    if status_code == 400:
+        return AnthropicErrorMapping(400, "invalid_request_error", message, {})
+    return AnthropicErrorMapping(status_code, "api_error", message, {})

@@ -2574,28 +2574,26 @@ class TestSanitizeJsonSchema:
     def test_returns_empty_dict_for_none(self):
         """
         What it does: Verifies handling of None.
-        Purpose: Ensure None returns empty dict.
+        Purpose: Ensure None becomes a minimal object schema (root must be an object).
         """
         print("Setup: None schema...")
         
         print("Action: Sanitizing schema...")
         result = sanitize_json_schema(None)
         
-        print(f"Comparing result: Expected {{}}, Got {result}")
-        assert result == {}
+        assert result == {"type": "object", "properties": {}}
     
     def test_returns_empty_dict_for_empty_dict(self):
         """
         What it does: Verifies handling of empty dict.
-        Purpose: Ensure empty dict is returned as-is.
+        Purpose: Ensure empty dict becomes a minimal object schema (root must be an object).
         """
         print("Setup: Empty dict...")
         
         print("Action: Sanitizing schema...")
         result = sanitize_json_schema({})
         
-        print(f"Comparing result: Expected {{}}, Got {result}")
-        assert result == {}
+        assert result == {"type": "object", "properties": {}}
     
     def test_removes_empty_required_array(self):
         """
@@ -2714,8 +2712,8 @@ class TestSanitizeJsonSchema:
     
     def test_sanitizes_items_in_lists(self):
         """
-        What it does: Verifies sanitization of items in lists (anyOf, oneOf).
-        Purpose: Ensure list elements are also sanitized.
+        What it does: Verifies combinator lists (anyOf, oneOf) are removed.
+        Purpose: Kiro rejects anyOf/oneOf/allOf; with several branches they are dropped.
         """
         print("Setup: Schema with anyOf...")
         schema = {
@@ -2729,9 +2727,8 @@ class TestSanitizeJsonSchema:
         result = sanitize_json_schema(schema)
         
         print(f"Result: {result}")
-        print("Checking anyOf elements...")
-        assert "additionalProperties" not in result["anyOf"][0]
-        assert "required" not in result["anyOf"][1]
+        assert "anyOf" not in result
+        assert result == {"type": "object", "properties": {}}
     
     def test_preserves_non_dict_list_items(self):
         """
@@ -5716,7 +5713,12 @@ class TestBuildKiroPayloadImages:
         assert len(history) >= 1
         
         print("Checking that first history message has images directly in userInputMessage (Issue #32 fix)...")
-        first_msg = history[0]["userInputMessage"]
+        # Skip the system prompt pair (gateway system additions may be enabled)
+        has_system_pair = (
+            len(history) > 1
+            and history[1].get("assistantResponseMessage", {}).get("content") == "I will follow these instructions."
+        )
+        first_msg = history[2 if has_system_pair else 0]["userInputMessage"]
         assert "images" in first_msg
         
         images = first_msg["images"]
@@ -6455,3 +6457,438 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+# ==================================================================================================
+# Kiro2cc parity: schema normalization, pairing, placeholders, envelope, additional fields
+# ==================================================================================================
+
+from kiro.converters_core import (  # noqa: E402
+    additional_fields_skipped,
+    build_additional_model_request_fields,
+    derive_agent_continuation_id,
+    drop_trailing_assistant_messages,
+    model_max_output_tokens,
+)
+
+
+def _payload(messages, tools=None, system_prompt="", model_id="claude-sonnet-4.6", **kwargs):
+    """Build a payload with gateway system additions disabled for deterministic output."""
+    with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+            patch("kiro.config.TRUNCATION_RECOVERY", False):
+        return build_kiro_payload(
+            messages=messages,
+            system_prompt=system_prompt,
+            model_id=model_id,
+            tools=tools,
+            conversation_id="conv-1",
+            profile_arn="",
+            thinking_config=ThinkingConfig(enabled=False),
+            **kwargs,
+        ).payload
+
+
+def _tool(name="shell"):
+    return UnifiedTool(name=name, description="d", input_schema={"type": "object", "properties": {}})
+
+
+def _call(tool_id, name="shell"):
+    return {"id": tool_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def _result(tool_id, content="ok"):
+    return {"type": "tool_result", "tool_use_id": tool_id, "content": content}
+
+
+class TestSanitizeJsonSchemaStrict:
+    """Port of kiro2cc-proxy schema.rs normalization."""
+
+    def test_resolves_defs_ref_and_drops_defs(self):
+        schema = {
+            "type": "object",
+            "properties": {"item": {"$ref": "#/$defs/Item", "description": "the item"}},
+            "$defs": {"Item": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+        }
+        result = sanitize_json_schema(schema)
+        assert "$defs" not in result
+        item = result["properties"]["item"]
+        assert item["type"] == "object"
+        assert item["properties"]["id"] == {"type": "integer"}
+        assert item["required"] == ["id"]
+        assert item["description"] == "the item"  # sibling key wins
+
+    def test_resolves_definitions_ref(self):
+        schema = {
+            "properties": {"x": {"$ref": "#/definitions/X"}},
+            "definitions": {"X": {"type": "string", "enum": ["a", "b"]}},
+        }
+        result = sanitize_json_schema(schema)
+        assert result["properties"]["x"] == {"type": "string", "enum": ["a", "b"]}
+        assert "definitions" not in result
+
+    def test_unresolvable_ref_becomes_permissive_object(self):
+        schema = {"type": "object", "properties": {"x": {"$ref": "#/components/schemas/X"}}}
+        result = sanitize_json_schema(schema)
+        assert result["properties"]["x"] == {"type": "object", "properties": {}}
+
+    def test_cyclic_ref_is_depth_limited(self):
+        schema = {
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}},
+        }
+        result = sanitize_json_schema(schema)
+        depth = 0
+        node = result["properties"]["node"]
+        while "child" in node.get("properties", {}):
+            node = node["properties"]["child"]
+            depth += 1
+        assert 10 <= depth <= 20
+        assert node["type"] == "object"
+
+    def test_strips_nulls_and_type_arrays(self):
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": ["null", "string"], "description": None}},
+            "required": None,
+        }
+        result = sanitize_json_schema(schema)
+        assert result == {"type": "object", "properties": {"name": {"type": "string"}}}
+
+    def test_properties_null_becomes_dict(self):
+        assert sanitize_json_schema({"type": "object", "properties": None}) == {"type": "object", "properties": {}}
+
+    def test_required_filtered_to_known_string_properties(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a", "missing", 3, "a"]}
+        assert sanitize_json_schema(schema)["required"] == ["a"]
+
+    def test_combinators_removed(self):
+        schema = {"type": "object", "properties": {"v": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}
+        assert sanitize_json_schema(schema)["properties"]["v"] == {}
+
+    def test_single_branch_optional_anyof_is_collapsed(self):
+        schema = {"type": "object", "properties": {"v": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "d"}}}
+        assert sanitize_json_schema(schema)["properties"]["v"] == {"type": "string", "description": "d"}
+
+    def test_allof_single_ref_is_collapsed(self):
+        schema = {
+            "properties": {"e": {"allOf": [{"$ref": "#/$defs/E"}]}},
+            "$defs": {"E": {"type": "string", "enum": ["x"]}},
+        }
+        assert sanitize_json_schema(schema)["properties"]["e"] == {"type": "string", "enum": ["x"]}
+
+    def test_whitelists_keys_and_drops_additional_properties(self):
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "title": "T",
+            "additionalProperties": False,
+            "properties": {"n": {"type": "number", "minimum": 0, "default": 1, "format": "x"}},
+        }
+        assert sanitize_json_schema(schema) == {"type": "object", "properties": {"n": {"type": "number"}}}
+
+    def test_items_tuple_takes_first_schema(self):
+        schema = {"type": "object", "properties": {"l": {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]}}}
+        assert sanitize_json_schema(schema)["properties"]["l"] == {"type": "array", "items": {"type": "string"}}
+
+    def test_root_forced_to_object(self):
+        assert sanitize_json_schema({"type": "string"}) == {"type": "object", "properties": {}}
+
+    def test_enum_keeps_only_scalars(self):
+        schema = {"properties": {"e": {"type": "string", "enum": ["a", None, {"x": 1}, 2]}}}
+        assert sanitize_json_schema(schema)["properties"]["e"]["enum"] == ["a", 2]
+
+    def test_does_not_mutate_input(self):
+        schema = {"properties": {"x": {"$ref": "#/$defs/X"}}, "$defs": {"X": {"type": "string"}}}
+        sanitize_json_schema(schema)
+        assert schema["properties"]["x"] == {"$ref": "#/$defs/X"}
+        assert "$defs" in schema
+
+
+class TestPlaceholderToolSpecs:
+
+    def test_adds_placeholder_for_history_only_tool(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1", "old_tool")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+        ]
+        payload = _payload(messages, tools=[_tool("shell")])
+        tools = payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+        names = [t["toolSpecification"]["name"] for t in tools]
+        assert names == ["shell", "old_tool"]
+        placeholder = tools[1]["toolSpecification"]
+        assert placeholder["description"] == "Tool used in conversation history"
+        assert placeholder["inputSchema"]["json"] == {"type": "object", "properties": {}}
+
+    def test_case_insensitive_match_adds_no_placeholder(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1", "SHELL")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+        ]
+        payload = _payload(messages, tools=[_tool("shell")])
+        tools = payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+        assert len(tools) == 1
+
+    def test_no_tools_still_strips_tool_content(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1", "old_tool")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+        ]
+        payload = _payload(messages, tools=None)
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "userInputMessageContext" not in current
+        assert "[Tool Result (t1)]" in current["content"]
+
+
+class TestToolPairingCleanup:
+
+    def test_drops_tool_use_without_result(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="calling", tool_calls=[_call("t1"), _call("t2")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+            UnifiedMessage(role="assistant", content="done"),
+            UnifiedMessage(role="user", content="next"),
+        ]
+        history = _payload(messages, tools=[_tool()])["conversationState"]["history"]
+        tool_uses = history[1]["assistantResponseMessage"]["toolUses"]
+        assert [tu["toolUseId"] for tu in tool_uses] == ["t1"]
+
+    def test_keeps_last_assistant_tool_uses_answered_by_current(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+        ]
+        cs = _payload(messages, tools=[_tool()])["conversationState"]
+        assert cs["history"][-1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"] == "t1"
+        current = cs["currentMessage"]["userInputMessage"]
+        assert current["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+        assert current["content"] == "(tool result above)"
+
+    def test_all_tool_uses_removed_leaves_valid_content(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="never mind"),
+        ]
+        history = _payload(messages, tools=[_tool()])["conversationState"]["history"]
+        assistant = history[1]["assistantResponseMessage"]
+        assert "toolUses" not in assistant
+        assert assistant["content"].strip()
+
+    def test_duplicate_tool_result_dropped(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1"), _result("t1", "again")]),
+        ]
+        current = _payload(messages, tools=[_tool()])["conversationState"]["currentMessage"]["userInputMessage"]
+        results = current["userInputMessageContext"]["toolResults"]
+        assert len(results) == 1
+        assert results[0]["content"][0]["text"] == "ok"
+
+    def test_result_for_earlier_turn_tool_use_becomes_text(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t2")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t2"), _result("t1", "stale")]),
+        ]
+        current = _payload(messages, tools=[_tool()])["conversationState"]["currentMessage"]["userInputMessage"]
+        assert [r["toolUseId"] for r in current["userInputMessageContext"]["toolResults"]] == ["t2"]
+        assert "stale" not in current["content"]  # already answered -> duplicate, dropped
+
+    def test_orphan_result_without_any_tool_use_becomes_text(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1"), _result("ghost", "ghost data")]),
+        ]
+        current = _payload(messages, tools=[_tool()])["conversationState"]["currentMessage"]["userInputMessage"]
+        assert [r["toolUseId"] for r in current["userInputMessageContext"]["toolResults"]] == ["t1"]
+        assert "[Tool Result (ghost)]" in current["content"]
+        assert "ghost data" in current["content"]
+
+
+class TestPlaceholderSemantics:
+
+    def test_history_user_with_only_tool_results(self):
+        messages = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[_call("t1")]),
+            UnifiedMessage(role="user", content="", tool_results=[_result("t1")]),
+            UnifiedMessage(role="assistant", content="done"),
+            UnifiedMessage(role="user", content="thanks"),
+        ]
+        history = _payload(messages, tools=[_tool()])["conversationState"]["history"]
+        assert history[1]["assistantResponseMessage"]["content"] == " "
+        assert history[2]["userInputMessage"]["content"] == "(tool result above)"
+
+    def test_trailing_assistant_prefill_dropped(self):
+        messages = [
+            UnifiedMessage(role="user", content="Hello"),
+            UnifiedMessage(role="assistant", content="{"),
+        ]
+        cs = _payload(messages)["conversationState"]
+        assert cs["currentMessage"]["userInputMessage"]["content"] == "Hello"
+        assert "history" not in cs
+
+    def test_drop_trailing_assistant_keeps_assistant_only_list(self):
+        messages = [UnifiedMessage(role="assistant", content="hi")]
+        assert drop_trailing_assistant_messages(messages) == messages
+
+    def test_assistant_only_conversation_still_builds(self):
+        cs = _payload([UnifiedMessage(role="assistant", content="hi")])["conversationState"]
+        assert cs["history"][-1]["assistantResponseMessage"]["content"] == "hi"
+        assert cs["currentMessage"]["userInputMessage"]["content"] == "(empty placeholder)"
+
+    def test_truly_empty_current_message_fallback(self):
+        cs = _payload([UnifiedMessage(role="user", content="")])["conversationState"]
+        assert cs["currentMessage"]["userInputMessage"]["content"] == "(empty placeholder)"
+
+
+class TestSystemPromptPair:
+
+    def test_single_turn_system_pair(self):
+        cs = _payload([UnifiedMessage(role="user", content="Hi")], system_prompt="Be nice")["conversationState"]
+        assert cs["history"] == [
+            {"userInputMessage": {"content": "Be nice", "modelId": "claude-sonnet-4.6", "origin": "AI_EDITOR"}},
+            {"assistantResponseMessage": {"content": "I will follow these instructions."}},
+        ]
+        assert cs["currentMessage"]["userInputMessage"]["content"] == "Hi"
+
+    def test_multi_turn_system_pair_and_alternation(self):
+        messages = [
+            UnifiedMessage(role="user", content="Q1"),
+            UnifiedMessage(role="assistant", content="A1"),
+            UnifiedMessage(role="user", content="Q2"),
+        ]
+        history = _payload(messages, system_prompt="Sys")["conversationState"]["history"]
+        roles = ["user" if "userInputMessage" in h else "assistant" for h in history]
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert history[0]["userInputMessage"]["content"] == "Sys"
+        assert history[2]["userInputMessage"]["content"] == "Q1"
+
+    def test_no_system_prompt_no_pair(self):
+        cs = _payload([UnifiedMessage(role="user", content="Hi")])["conversationState"]
+        assert "history" not in cs
+
+    def test_prefix_is_stable_across_turns(self):
+        turn1 = _payload([UnifiedMessage(role="user", content="Q1")], system_prompt="Sys")
+        turn2 = _payload([
+            UnifiedMessage(role="user", content="Q1"),
+            UnifiedMessage(role="assistant", content="A1"),
+            UnifiedMessage(role="user", content="Q2"),
+        ], system_prompt="Sys")
+        assert turn1["conversationState"]["history"][:2] == turn2["conversationState"]["history"][:2]
+
+    def test_gateway_additions_go_into_system_pair_and_thinking_tags_into_current(self):
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = build_kiro_payload(
+                messages=[UnifiedMessage(role="user", content="Hi")],
+                system_prompt="Sys",
+                model_id="claude-sonnet-4.6",
+                tools=None,
+                conversation_id="c",
+                profile_arn="",
+                thinking_config=ThinkingConfig(enabled=True, budget_tokens=1000),
+            ).payload
+        cs = payload["conversationState"]
+        assert "Sys" in cs["history"][0]["userInputMessage"]["content"]
+        assert "Extended Thinking Mode" in cs["history"][0]["userInputMessage"]["content"]
+        current = cs["currentMessage"]["userInputMessage"]["content"]
+        assert current.startswith("<thinking_mode>enabled</thinking_mode>")
+        assert current.endswith("Hi")
+
+    def test_trim_keeps_system_pair(self):
+        messages = []
+        for i in range(10):
+            messages.append(UnifiedMessage(role="user", content=f"u{i} " + "x" * 500))
+            messages.append(UnifiedMessage(role="assistant", content=f"a{i} " + "y" * 500))
+        messages.append(UnifiedMessage(role="user", content="now"))
+        with patch("kiro.converters_core.AUTO_TRIM_PAYLOAD", True), \
+                patch("kiro.converters_core.KIRO_MAX_PAYLOAD_BYTES", 4000):
+            history = _payload(messages, system_prompt="Sys")["conversationState"]["history"]
+        assert history[0]["userInputMessage"]["content"] == "Sys"
+        assert history[1]["assistantResponseMessage"]["content"] == "I will follow these instructions."
+        assert "userInputMessage" in history[2]
+        assert len(history) < 22
+
+
+class TestEnvelopeFields:
+
+    def test_agent_task_type_spectask_with_tools(self):
+        cs = _payload([UnifiedMessage(role="user", content="Hi")], tools=[_tool()])["conversationState"]
+        assert cs["agentTaskType"] == "spectask"
+
+    def test_agent_task_type_vibe_without_tools(self):
+        cs = _payload([UnifiedMessage(role="user", content="Hi")])["conversationState"]
+        assert cs["agentTaskType"] == "vibe"
+        assert cs["chatTriggerType"] == "MANUAL"
+
+    def test_agent_continuation_id_matches_reference_derivation(self):
+        import hashlib
+        digest = hashlib.sha256(b"agent-continuation:conv-1").hexdigest()
+        expected = f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+        assert derive_agent_continuation_id("conv-1") == expected
+        cs = _payload([UnifiedMessage(role="user", content="Hi")])["conversationState"]
+        assert cs["agentContinuationId"] == expected
+
+    def test_agent_continuation_id_is_deterministic_and_distinct(self):
+        assert derive_agent_continuation_id("a") == derive_agent_continuation_id("a")
+        assert derive_agent_continuation_id("a") != derive_agent_continuation_id("b")
+        assert len(derive_agent_continuation_id("a")) == 36
+
+
+class TestAdditionalModelRequestFields:
+
+    def test_default_effort_and_clamped_max_tokens(self):
+        fields = build_additional_model_request_fields("claude-sonnet-4.6", 200000, None)
+        assert fields == {"output_config": {"effort": "low"}, "max_tokens": 64000}
+
+    def test_min_max_tokens_is_1024(self):
+        fields = build_additional_model_request_fields("claude-sonnet-4.6", 200, None)
+        assert fields["max_tokens"] == 1024
+
+    def test_opus_large_cap(self):
+        assert model_max_output_tokens("claude-opus-4.7") == 128000
+        assert model_max_output_tokens("claude-opus-5") == 128000
+        assert model_max_output_tokens("claude-sonnet-5") == 64000
+        fields = build_additional_model_request_fields("claude-opus-4.8", 500000, {"effort": "high"})
+        assert fields == {"output_config": {"effort": "high"}, "max_tokens": 128000}
+
+    def test_no_max_tokens(self):
+        assert build_additional_model_request_fields("claude-sonnet-4.6", None, None) == {
+            "output_config": {"effort": "low"}
+        }
+
+    def test_skipped_for_45_generation_and_legacy(self):
+        assert additional_fields_skipped("claude-sonnet-4.5")
+        assert additional_fields_skipped("claude-haiku-4.5")
+        assert additional_fields_skipped("claude-opus-4.5")
+        assert additional_fields_skipped("claude-3.7-sonnet")
+        assert additional_fields_skipped("auto")
+        assert not additional_fields_skipped("claude-sonnet-4.6")
+        assert build_additional_model_request_fields("claude-sonnet-4.5", 4096, None) is None
+
+    def test_gpt_reasoning_effort(self):
+        assert build_additional_model_request_fields("gpt-5.6-sol", 4096, None) == {"reasoning": {"effort": "high"}}
+        assert build_additional_model_request_fields("gpt-5.6-sol", 4096, {"effort": "low"}) == {
+            "reasoning": {"effort": "low"}
+        }
+
+    def test_env_flag_disables(self):
+        with patch("kiro.converters_core.KIRO_ADDITIONAL_MODEL_FIELDS", False):
+            assert build_additional_model_request_fields("claude-sonnet-4.6", 4096, None) is None
+
+    def test_placed_at_payload_top_level(self):
+        payload = _payload([UnifiedMessage(role="user", content="Hi")], max_tokens=8192, output_config={"effort": "medium"})
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}, "max_tokens": 8192}
+        assert "additionalModelRequestFields" not in payload["conversationState"]
+
+    def test_absent_for_skipped_model(self):
+        payload = _payload([UnifiedMessage(role="user", content="Hi")], model_id="claude-sonnet-4.5", max_tokens=8192)
+        assert "additionalModelRequestFields" not in payload

@@ -32,16 +32,108 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
+import random
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    MAX_RETRY_DELAY,
+    THROTTLE_BASE_DELAY,
+    THROTTLE_STEP_DELAY,
+    THROTTLE_MAX_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+)
+from kiro.endpoints import endpoint_candidates, endpoint_registry
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+
+
+def backoff_delay(attempt: int) -> float:
+    """
+    Exponential backoff with +/-25% jitter for 5xx/408/network errors.
+
+    Args:
+        attempt: 0-based attempt index
+
+    Returns:
+        Delay in seconds
+    """
+    base = min(BASE_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+    return max(0.0, base * random.uniform(0.75, 1.25))
+
+
+def throttle_delay(attempt: int, retry_after: Optional[str] = None) -> float:
+    """
+    Backoff for 429: linear growth with jitter; honours Retry-After if present.
+
+    Args:
+        attempt: 0-based attempt index
+        retry_after: Raw Retry-After header value (seconds), if any
+
+    Returns:
+        Delay in seconds
+    """
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), THROTTLE_MAX_DELAY)
+        except ValueError:
+            pass
+    base = min(THROTTLE_BASE_DELAY + attempt * THROTTLE_STEP_DELAY, THROTTLE_MAX_DELAY)
+    return base + random.uniform(0.0, 1.5)
+
+
+# Models for which Kiro rejected additionalModelRequestFields (learned at runtime)
+_ADDITIONAL_FIELDS_REJECTED: set = set()
+
+ADDITIONAL_FIELDS_KEY = "additionalModelRequestFields"
+
+
+def _payload_model_id(json_data: Optional[dict]) -> Optional[str]:
+    """Returns the Kiro modelId from a generateAssistantResponse payload, if any."""
+    try:
+        return json_data["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+    except (KeyError, TypeError):
+        return None
+
+
+def strip_rejected_additional_fields(json_data: Optional[dict]) -> Optional[dict]:
+    """
+    Drops additionalModelRequestFields for models Kiro already rejected it for.
+
+    Args:
+        json_data: Kiro request payload
+
+    Returns:
+        Payload (a shallow copy without the field when stripped)
+    """
+    if isinstance(json_data, dict) and ADDITIONAL_FIELDS_KEY in json_data:
+        if _payload_model_id(json_data) in _ADDITIONAL_FIELDS_REJECTED:
+            return {k: v for k, v in json_data.items() if k != ADDITIONAL_FIELDS_KEY}
+    return json_data
+
+
+def agent_mode_for_payload(json_data: Optional[dict]) -> str:
+    """
+    Picks the x-amzn-kiro-agent-mode header from the payload's agentTaskType.
+
+    Args:
+        json_data: Kiro request payload
+
+    Returns:
+        "spectask" or "vibe"
+    """
+    if isinstance(json_data, dict):
+        task_type = (json_data.get("conversationState") or {}).get("agentTaskType")
+        if task_type == "spectask":
+            return "spectask"
+    return "vibe"
 
 
 class KiroHttpClient:
@@ -180,8 +272,9 @@ class KiroHttpClient:
         
         Automatically handles various error types:
         - 403: refreshes token via auth_manager.force_refresh() and retries
-        - 429: waits with exponential backoff (1s, 2s, 4s)
-        - 5xx: waits with exponential backoff
+        - 429: rotates to the next configured endpoint (KIRO_ENDPOINTS), otherwise
+          waits with linear backoff + jitter (Retry-After honoured)
+        - 408/5xx: waits with capped exponential backoff + jitter
         - Timeouts: waits with exponential backoff
         
         For streaming, STREAMING_READ_TIMEOUT is used for waiting between chunks.
@@ -209,11 +302,27 @@ class KiroHttpClient:
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
         
+        json_data = strip_rejected_additional_fields(json_data)
+        endpoints = endpoint_candidates(url)
+        account_key = id(self.auth_manager)
+        agent_mode = agent_mode_for_payload(json_data)
+
         for attempt in range(max_retries):
             try:
+                # Rotate across endpoints: throttled buckets are moved to the back
+                endpoint = endpoint_registry.order(account_key, endpoints)[0]
+                request_url = endpoint.url if endpoint.name != "custom" else url
+
                 # Get current token
                 token = await self.auth_manager.get_access_token()
-                headers = get_kiro_headers(self.auth_manager, token)
+                headers = get_kiro_headers(
+                    self.auth_manager,
+                    token,
+                    amz_target=endpoint.amz_target if endpoint.name != "custom" else
+                    "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                    attempt=attempt + 1,
+                    agent_mode=agent_mode,
+                )
                 
                 # Build request kwargs based on parameters
                 request_kwargs = {"headers": headers}
@@ -227,12 +336,12 @@ class KiroHttpClient:
                 if stream:
                     # Prevent CLOSE_WAIT connection leak (issue #38)
                     headers["Connection"] = "close"
-                    req = client.build_request(method, url, **request_kwargs)
-                    logger.debug("Sending request to Kiro API...")
+                    req = client.build_request(method, request_url, **request_kwargs)
+                    logger.debug(f"Sending request to Kiro API ({endpoint.name})...")
                     response = await client.send(req, stream=True)
                 else:
-                    logger.debug("Sending request to Kiro API...")
-                    response = await client.request(method, url, **request_kwargs)
+                    logger.debug(f"Sending request to Kiro API ({endpoint.name})...")
+                    response = await client.request(method, request_url, **request_kwargs)
                 
                 # Check status
                 if response.status_code == 200:
@@ -244,21 +353,62 @@ class KiroHttpClient:
                     await self.auth_manager.force_refresh()
                     continue
                 
-                # 429 - rate limit, wait and retry
+                # 429 - rate limit: mark endpoint bucket, rotate, back off
                 if response.status_code == 429:
-                    last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(delay)
+                    last_response = response  # Keep for caller after exhaustion
+                    if len(endpoints) > 1:
+                        endpoint_registry.throttle(account_key, endpoint.name)
+                    retry_after = None
+                    resp_headers = getattr(response, "headers", None)
+                    if isinstance(resp_headers, (dict, httpx.Headers)):
+                        retry_after = resp_headers.get("retry-after")
+                    # Other endpoints are separate buckets: switch without waiting
+                    free_left = len(endpoints) > 1 and any(
+                        not endpoint_registry.is_throttled(account_key, e.name) for e in endpoints
+                    )
+                    if free_left:
+                        logger.warning(
+                            f"Received 429 on '{endpoint.name}', switching endpoint "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        continue
+                    if attempt < max_retries - 1:
+                        delay = throttle_delay(attempt, retry_after)
+                        logger.warning(f"Received 429, waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(delay)
                     continue
                 
-                # 5xx - server error, wait and retry
-                if 500 <= response.status_code < 600:
-                    last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(delay)
+                # 408 / 5xx - transient server error, wait and retry
+                if response.status_code == 408 or 500 <= response.status_code < 600:
+                    last_response = response  # Keep for caller after exhaustion
+                    if attempt < max_retries - 1:
+                        delay = backoff_delay(attempt)
+                        logger.warning(
+                            f"Received {response.status_code}, waiting {delay:.1f}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(delay)
                     continue
+                
+                # 400 because this model doesn't accept additionalModelRequestFields:
+                # remember it, strip the field and retry once
+                if (
+                    response.status_code == 400
+                    and isinstance(json_data, dict)
+                    and ADDITIONAL_FIELDS_KEY in json_data
+                ):
+                    body = await response.aread()
+                    if ADDITIONAL_FIELDS_KEY.encode() in body:
+                        model_id = _payload_model_id(json_data)
+                        if model_id:
+                            _ADDITIONAL_FIELDS_REJECTED.add(model_id)
+                        logger.warning(
+                            f"Kiro rejected {ADDITIONAL_FIELDS_KEY} for model '{model_id}', "
+                            f"retrying without it"
+                        )
+                        await response.aclose()
+                        json_data = {k: v for k, v in json_data.items() if k != ADDITIONAL_FIELDS_KEY}
+                        continue
                 
                 # Other errors - return as is
                 return response
@@ -274,8 +424,8 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    delay = backoff_delay(attempt)
+                    logger.warning(f"{short_msg} - waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
@@ -293,8 +443,8 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    delay = backoff_delay(attempt)
+                    logger.warning(f"{short_msg} - waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")

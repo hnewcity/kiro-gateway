@@ -739,8 +739,12 @@ class TestBuildKiroPayload:
         result = build_kiro_payload(request, "conv-123", "")
         
         print(f"Result: {result}")
+        # System prompt is now emitted as a separate leading history pair
+        history = result["conversationState"]["history"]
+        assert "You are helpful" in history[0]["userInputMessage"]["content"]
+        assert history[1]["assistantResponseMessage"]["content"] == "I will follow these instructions."
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "You are helpful" in current_content
+        assert "You are helpful" not in current_content
         assert "Hello" in current_content
 
     def test_includes_response_format_json_schema_instruction(self):
@@ -769,9 +773,10 @@ class TestBuildKiroPayload:
         result = build_kiro_payload(request, "conv-123", "")
 
         print(f"Result: {result}")
+        system_content = result["conversationState"]["history"][0]["userInputMessage"]["content"]
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "respond with JSON only" in current_content
-        assert '"name":"answer"' in current_content
+        assert "respond with JSON only" in system_content
+        assert '"name":"answer"' in system_content
         assert "Return the answer" in current_content
 
     def test_includes_response_format_json_object_instruction(self):
@@ -790,8 +795,9 @@ class TestBuildKiroPayload:
         result = build_kiro_payload(request, "conv-123", "")
 
         print(f"Result: {result}")
+        system_content = result["conversationState"]["history"][0]["userInputMessage"]["content"]
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "valid JSON object only" in current_content
+        assert "valid JSON object only" in system_content
         assert "Return the answer" in current_content
     
     def test_builds_history_for_multi_turn(self):
@@ -810,7 +816,10 @@ class TestBuildKiroPayload:
         )
         
         print("Action: Building payload...")
-        result = build_kiro_payload(request, "conv-123", "")
+        with patch('kiro.converters_core.FAKE_REASONING_ENABLED', False), \
+                patch('kiro.config.TRUNCATION_RECOVERY', False):
+            # No system prompt at all -> no system pair in history
+            result = build_kiro_payload(request, "conv-123", "")
         
         print(f"Result: {result}")
         assert "history" in result["conversationState"]
@@ -819,7 +828,8 @@ class TestBuildKiroPayload:
     def test_handles_assistant_as_last_message(self):
         """
         What it does: Verifies handling of assistant as last message.
-        Purpose: Ensure "(empty placeholder)" message is created.
+        Purpose: Ensure trailing assistant prefill is dropped (Kiro has no prefill),
+        so the preceding user turn becomes the current message.
         """
         print("Setup: Request with assistant at the end...")
         request = ChatCompletionRequest(
@@ -835,7 +845,11 @@ class TestBuildKiroPayload:
         
         print(f"Result: {result}")
         current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert current_content == "(empty placeholder)"
+        assert current_content.endswith("Hello")
+        history = result["conversationState"].get("history", [])
+        assert all(
+            h.get("assistantResponseMessage", {}).get("content") != "Hi there" for h in history
+        )
     
     def test_raises_for_empty_messages(self):
         """
@@ -1385,7 +1399,11 @@ class TestBuildKiroPayloadToolCallsIntegration:
         assert len(assistant_msgs) >= 1, "Should have at least one assistantResponseMessage"
         
         # Check that assistantResponseMessage has both toolUses
-        assistant_msg = assistant_msgs[0]["assistantResponseMessage"]
+        # (skip the system prompt acknowledgement pair, which carries no toolUses)
+        assistant_msg = next(
+            m["assistantResponseMessage"] for m in assistant_msgs
+            if m["assistantResponseMessage"].get("toolUses")
+        )
         tool_uses = assistant_msg.get("toolUses", [])
         print(f"ToolUses in assistant: {tool_uses}")
         print(f"Comparing toolUses count: Expected 2, Got {len(tool_uses)}")
@@ -1438,10 +1456,10 @@ class TestBuildKiroPayloadToolCallsIntegration:
             result = build_kiro_payload(request, "conv-123", "")
         
         print("Checking that system prompt contains tool documentation...")
-        current_content = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        assert "You are helpful" in current_content
-        assert "## Tool: long_tool" in current_content
-        assert long_desc in current_content
+        system_content = result["conversationState"]["history"][0]["userInputMessage"]["content"]
+        assert "You are helpful" in system_content
+        assert "## Tool: long_tool" in system_content
+        assert long_desc in system_content
         
         print("Checking that tool in context has reference description...")
         tools_context = result["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
@@ -1954,3 +1972,29 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestOpenAIAdditionalModelFields:
+    """OpenAI adapter maps max_tokens / reasoning_effort into additionalModelRequestFields."""
+
+    def test_reasoning_effort_and_max_tokens(self):
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-6",
+            messages=[ChatMessage(role="user", content="Hi")],
+            max_tokens=4096,
+            reasoning_effort="medium",
+        )
+        result = build_kiro_payload(request, "conv-1", "")
+        assert result["additionalModelRequestFields"] == {
+            "output_config": {"effort": "medium"},
+            "max_tokens": 4096,
+        }
+
+    def test_unmapped_effort_uses_default(self):
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4-6",
+            messages=[ChatMessage(role="user", content="Hi")],
+            reasoning_effort="xhigh",
+        )
+        result = build_kiro_payload(request, "conv-1", "")
+        assert result["additionalModelRequestFields"] == {"output_config": {"effort": "low"}}

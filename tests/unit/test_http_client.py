@@ -16,7 +16,10 @@ from fastapi import HTTPException
 
 from kiro.http_client import KiroHttpClient
 from kiro.auth import KiroAuthManager
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT,
+    THROTTLE_BASE_DELAY, THROTTLE_STEP_DELAY,
+)
 
 
 @pytest.fixture
@@ -516,8 +519,8 @@ class TestKiroHttpClientExponentialBackoff:
     @pytest.mark.asyncio
     async def test_backoff_delay_increases_exponentially(self, mock_auth_manager_for_http):
         """
-        What it does: Verifies exponential delay increase.
-        Purpose: Ensure delay = BASE_RETRY_DELAY * (2 ** attempt).
+        What it does: Verifies 429 backoff grows between attempts.
+        Purpose: Ensure 429 uses throttle_delay (linear + jitter), not raw 2**n.
         """
         print("Setup: Creating KiroHttpClient...")
         http_client = KiroHttpClient(mock_auth_manager_for_http)
@@ -552,11 +555,14 @@ class TestKiroHttpClientExponentialBackoff:
                         {"data": "value"}
                     )
         
-        print(f"Verification: Delays increase exponentially...")
+        print(f"Verification: 429 delays grow linearly with jitter...")
         print(f"Delays: {sleep_delays}")
         assert len(sleep_delays) == 2
-        assert sleep_delays[0] == BASE_RETRY_DELAY * (2 ** 0)  # 1.0
-        assert sleep_delays[1] == BASE_RETRY_DELAY * (2 ** 1)  # 2.0
+        # throttle_delay: THROTTLE_BASE_DELAY + attempt * THROTTLE_STEP_DELAY + U(0, 1.5)
+        assert THROTTLE_BASE_DELAY <= sleep_delays[0] <= THROTTLE_BASE_DELAY + 1.5
+        assert (THROTTLE_BASE_DELAY + THROTTLE_STEP_DELAY) <= sleep_delays[1] <= (
+            THROTTLE_BASE_DELAY + THROTTLE_STEP_DELAY + 1.5
+        )
 
 
 class TestKiroHttpClientStreamingTimeout:

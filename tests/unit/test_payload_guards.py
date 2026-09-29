@@ -201,3 +201,44 @@ class TestTrimPayloadToLimit:
         assert not stats.trimmed
         assert stats.original_entries == 0
         assert stats.final_entries == 0
+
+
+class TestRepairToolPairing:
+
+    def test_removes_unanswered_tool_use_and_keeps_current(self):
+        from kiro.payload_guards import repair_tool_pairing
+        history = [
+            {"userInputMessage": {"content": "go"}},
+            {"assistantResponseMessage": {"content": "x", "toolUses": [
+                {"toolUseId": "a", "name": "t"}, {"toolUseId": "b", "name": "t"}]}},
+        ]
+        kept, orphan_text = repair_tool_pairing(history, [{"toolUseId": "a", "content": [{"text": "r"}]}])
+        assert [r["toolUseId"] for r in kept] == ["a"]
+        assert orphan_text == ""
+        assert [tu["toolUseId"] for tu in history[1]["assistantResponseMessage"]["toolUses"]] == ["a"]
+
+    def test_history_orphan_replaces_tool_result_hint(self):
+        from kiro.payload_guards import repair_tool_pairing
+        history = [
+            {"userInputMessage": {"content": "go"}},
+            {"assistantResponseMessage": {"content": "no tools"}},
+            {"userInputMessage": {"content": "(tool result above)", "userInputMessageContext": {
+                "toolResults": [{"toolUseId": "z", "content": [{"text": "zzz"}]}]}}},
+            {"assistantResponseMessage": {"content": "ok"}},
+        ]
+        repair_tool_pairing(history, None)
+        user = history[2]["userInputMessage"]
+        assert "userInputMessageContext" not in user
+        assert user["content"] == "[Tool Result (z)]\nzzz"
+
+
+class TestTrimKeepsPrefix:
+
+    def test_keep_prefix_entries(self):
+        payload = _make_payload(num_pairs=10, content_size=500)
+        history = payload["conversationState"]["history"]
+        first_two = [dict(history[0]), dict(history[1])]
+        trim_payload_to_limit(payload, max_bytes=3000, keep_prefix_entries=2)
+        assert history[:2] == first_two
+        assert "userInputMessage" in history[2]
+        assert len(history) < 20

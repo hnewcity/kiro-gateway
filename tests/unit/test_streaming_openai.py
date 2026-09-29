@@ -1334,7 +1334,8 @@ class TestStreamingOpenaiMeteringData:
         
         async def mock_parse_kiro_stream(*args, **kwargs):
             yield KiroEvent(type="content", content="Hello")
-            yield KiroEvent(type="usage", usage={"credits": 0.001})
+            # Real metering shape: full dict with the credit amount under "usage"
+            yield KiroEvent(type="usage", usage={"usage": 0.001, "unit": "credit"})
         
         print("Action: Streaming to OpenAI format...")
         chunks = []
@@ -1349,9 +1350,11 @@ class TestStreamingOpenaiMeteringData:
         
         print(f"Received {len(chunks)} chunks")
         
-        # Final chunk should have credits_used
+        # Final chunk should have credits_used as the numeric credit amount
         final_chunk = chunks[-2]  # Before [DONE]
         assert '"credits_used"' in final_chunk
+        final_data = json.loads(final_chunk[len("data: "):])
+        assert final_data["usage"]["credits_used"] == 0.001
         print("✓ credits_used included in usage")
 
 
@@ -1485,3 +1488,193 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+# ==================================================================================================
+# Tests for exception events and metering dict
+# ==================================================================================================
+
+from kiro.streaming_core import KiroStreamError
+from kiro.streaming_openai import _extract_credits_used, collect_stream_response
+
+
+def _parse_sse(chunk: str) -> dict:
+    """Parses a 'data: {...}' SSE chunk."""
+    return json.loads(chunk[len("data: "):])
+
+
+class TestStreamingOpenaiExceptionEvents:
+    """Tests for upstream exception events in the OpenAI streaming path."""
+
+    @pytest.mark.asyncio
+    async def test_content_length_exceeded_sets_finish_reason_length(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams content followed by ContentLengthExceededException.
+        Goal: Ensure the stream finishes with finish_reason "length" and [DONE].
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="partial answer")
+            yield KiroEvent(type="exception", exception_type="ContentLengthExceededException", exception_message="too long")
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        assert chunks[-1] == "data: [DONE]\n\n"
+        final = _parse_sse(chunks[-2])
+        assert final["choices"][0]["finish_reason"] == "length"
+        assert not any('"error"' in c for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_content_length_exceeded_with_tool_calls_is_still_length(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a tool call then ContentLengthExceededException.
+        Goal: Ensure the length stop takes priority over tool_calls.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use={"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}})
+            yield KiroEvent(type="exception", exception_type="ContentLengthExceededException", exception_message="")
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        assert _parse_sse(chunks[-2])["choices"][0]["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_other_exception_emits_error_and_raises(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams content followed by a ThrottlingException.
+        Goal: Ensure an error chunk is sent, no normal final chunk, and the error propagates.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="exception", exception_type="ThrottlingException", exception_message="Too many requests")
+            yield KiroEvent(type="content", content="never reached")
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroStreamError) as exc_info:
+                    async for chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        assert exc_info.value.exception_type == "ThrottlingException"
+        error = _parse_sse(chunks[-1])
+        assert error == {"error": {"message": "Too many requests", "type": "kiro_api_error", "code": "ThrottlingException"}}
+        assert not any('"finish_reason": "stop"' in c for c in chunks)
+        assert "data: [DONE]\n\n" not in chunks
+        assert not any("never reached" in c for c in chunks)
+        mock_response.aclose.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_propagates_exception(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Collects a non-streaming response with an upstream exception.
+        Goal: Ensure the error propagates instead of returning a fake successful completion.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="exception", exception_type="InternalServerException", exception_message="boom")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with pytest.raises(KiroStreamError):
+                    await collect_stream_response(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_content_length_exceeded(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Collects a non-streaming response ending in ContentLengthExceededException.
+        Goal: Ensure finish_reason is "length" and content is kept.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="partial")
+            yield KiroEvent(type="exception", exception_type="ContentLengthExceededException", exception_message="")
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                )
+
+        assert result["choices"][0]["finish_reason"] == "length"
+        assert result["choices"][0]["message"]["content"] == "partial"
+
+
+class TestStreamingOpenaiMeteringDict:
+    """Tests for the full metering dict contract."""
+
+    def test_extract_credits_used(self):
+        """
+        What it does: Extracts credits from metering dicts of various shapes.
+        Goal: Ensure only a numeric "usage" field is used.
+        """
+        assert _extract_credits_used({"usage": 0.12, "unit": "credit", "cacheReadInputTokens": 5}) == 0.12
+        assert _extract_credits_used({"usage": 2}) == 2
+        assert _extract_credits_used({"credits": 0.1}) is None
+        assert _extract_credits_used({"usage": "0.1"}) is None
+        assert _extract_credits_used({"usage": True}) is None
+        assert _extract_credits_used(None) is None
+
+    @pytest.mark.asyncio
+    async def test_credits_used_is_number_with_cache_fields(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a metering dict with cache fields.
+        Goal: Ensure credits_used stays numeric (unchanged OpenAI behavior).
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="usage", usage={"usage": 0.5, "unit": "credit", "cacheReadInputTokens": 100})
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        final = _parse_sse(chunks[-2])
+        assert final["usage"]["credits_used"] == 0.5
+        assert final["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_metering_without_credit_amount_omits_credits_used(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a metering dict without a "usage" amount.
+        Goal: Ensure credits_used is omitted but the stream still counts as completed.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="usage", usage={"unit": "credit"})
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        final = _parse_sse(chunks[-2])
+        assert "credits_used" not in final["usage"]
+        assert final["choices"][0]["finish_reason"] == "stop"

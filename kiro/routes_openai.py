@@ -28,6 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -50,7 +51,7 @@ from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.profile_arn import profile_arn_for_payload
-from kiro.utils import generate_conversation_id, get_kiro_headers
+from kiro.utils import derive_conversation_id, generate_conversation_id, get_kiro_headers
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -88,6 +89,38 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
 
 # --- Router ---
 router = APIRouter()
+
+
+
+def _stable_conversation_id(request_data: Any) -> str:
+    """
+    Derives a stable Kiro conversationId for an OpenAI chat request.
+
+    Uses system messages + tool names + first non-system message, so every
+    turn of the same conversation maps to the same Kiro conversation.
+
+    Args:
+        request_data: ChatCompletionRequest
+
+    Returns:
+        UUID-formatted conversation ID
+    """
+    from kiro.config import STABLE_CONVERSATION_ID
+
+    if not STABLE_CONVERSATION_ID:
+        return generate_conversation_id()
+    messages = list(request_data.messages or [])
+    system = [m.content for m in messages if getattr(m, "role", None) in ("system", "developer")]
+    first = next((m.content for m in messages if getattr(m, "role", None) not in ("system", "developer")), None)
+    tool_names = []
+    for tool in request_data.tools or []:
+        function = getattr(tool, "function", None)
+        name = getattr(function, "name", None) if function is not None else getattr(tool, "name", None)
+        if name:
+            tool_names.append(name)
+    user = getattr(request_data, "user", None)
+    metadata = {"user_id": user} if isinstance(user, str) else None
+    return derive_conversation_id(metadata, system, tool_names, first)
 
 
 @router.get("/")
@@ -360,7 +393,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             model_resolver = account.model_resolver
             
             # Generate conversation ID
-            conversation_id = generate_conversation_id()
+            conversation_id = _stable_conversation_id(request_data)
             
             # Build payload for Kiro
             selected_profile_arn = profile_arn_for_payload(auth_manager)
@@ -614,8 +647,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         model_cache = account.model_cache
         model_resolver = account.model_resolver
     
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
+    # Stable conversation ID so Kiro can reuse per-conversation state
+    conversation_id = _stable_conversation_id(request_data)
     
     # Build payload for Kiro
     selected_profile_arn = profile_arn_for_payload(auth_manager)

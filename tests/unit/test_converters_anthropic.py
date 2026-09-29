@@ -1497,7 +1497,12 @@ class TestAnthropicToKiro:
             "userInputMessage"
         ]["content"]
         print(f"Current content: {current_content}")
-        assert "You are a helpful assistant." in current_content
+        # System prompt is now a separate leading history pair, not merged into the user turn
+        history = result["conversationState"]["history"]
+        assert "You are a helpful assistant." in history[0]["userInputMessage"]["content"]
+        assert history[1]["assistantResponseMessage"]["content"] == "I will follow these instructions."
+        assert "You are a helpful assistant." not in current_content
+        assert current_content == "Hello!"
 
     def test_includes_tools(self):
         """
@@ -1559,7 +1564,9 @@ class TestAnthropicToKiro:
             "kiro.converters_anthropic.get_model_id_for_kiro",
             return_value="claude-sonnet-4.5",
         ):
-            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False), \
+                    patch("kiro.config.TRUNCATION_RECOVERY", False):
+                # No system prompt at all -> no system pair in history
                 result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
 
         print(f"Result: {result}")
@@ -1884,3 +1891,35 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestAnthropicAdditionalModelFields:
+    """anthropic_to_kiro forwards max_tokens and output_config to the core layer."""
+
+    def test_output_config_and_max_tokens_forwarded(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            max_tokens=2048,
+            output_config={"effort": "high"},
+        )
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.6"):
+            result = anthropic_to_kiro(request, "conv-1", "")
+        assert result["additionalModelRequestFields"] == {
+            "output_config": {"effort": "high"},
+            "max_tokens": 2048,
+        }
+        assert result["conversationState"]["agentTaskType"] == "vibe"
+
+    def test_default_effort_when_output_config_missing(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            max_tokens=100,
+        )
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.6"):
+            result = anthropic_to_kiro(request, "conv-1", "")
+        assert result["additionalModelRequestFields"] == {
+            "output_config": {"effort": "low"},
+            "max_tokens": 1024,
+        }

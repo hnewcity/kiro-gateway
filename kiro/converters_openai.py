@@ -421,6 +421,24 @@ def _response_format_to_system_prompt(request: ChatCompletionRequest) -> str:
     return ""
 
 
+def _reasoning_effort_to_output_config(request: ChatCompletionRequest) -> Optional[Dict[str, str]]:
+    """
+    Map OpenAI reasoning_effort to an output_config for additionalModelRequestFields.
+
+    Only low/medium/high are forwarded (values shared by Claude output_config.effort
+    and GPT reasoning.effort); other values fall back to the converter defaults.
+
+    Args:
+        request: OpenAI ChatCompletionRequest
+
+    Returns:
+        {"effort": ...} or None
+    """
+    if request.reasoning_effort in ("low", "medium", "high"):
+        return {"effort": request.reasoning_effort}
+    return None
+
+
 # ==================================================================================================
 # Main Entry Point
 # ==================================================================================================
@@ -483,7 +501,9 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        max_tokens=request_data.max_tokens or request_data.max_completion_tokens,
+        output_config=_reasoning_effort_to_output_config(request_data),
     )
     
     return result.payload
